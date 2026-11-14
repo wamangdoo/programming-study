@@ -346,7 +346,9 @@ class FirstRunTest(GuiTest):
         self.idle()
         self.assertIs(self.page(), page)
         self.assertEqual(self.attempts(), [])
-        self.submit_round()
+        with mock.patch.object(win.auto_submission, "request") as checkpoint:
+            self.submit_round()
+            checkpoint.assert_called_once()
 
         # 결과: 점수·숙달 단원·문항별 결과·해설
         size = len(page.view["items"])
@@ -459,7 +461,7 @@ class FirstRunTest(GuiTest):
         QTest.keyClicks(dialog.edit, "tester")
         click(dialog.ok)
         self.assertTrue(dialog.isVisible())  # 아직 저장하지 않음
-        self.assertIsNone(session.saved_user())
+        self.assertFalse(os.path.lexists(study.USER_FILE))
         self.assertIn("Tester 의 풀이 기록", dialog.error.text())
         self.assertEqual(dialog.ok.text(), "이 기록으로 시작")
         for label in dialog.findChildren(QLabel):  # 안내가 두 줄로 늘어도 위의 설명이 눌려 잘리지 않음
@@ -598,6 +600,10 @@ class HomeAndGitTest(GuiTest):
         self.assertTrue(self.win.home.notice.isVisible())
         before = self.win.session
         self.git.replies["sync"] = {"status": "ok", "message": "새 문제를 받았습니다.", "changed": True}
+        self.assertFalse(self.win.home.sync_btn.isVisible())
+        self.win.problem_updates = {"status": "ok", "available": True, "count": 1}
+        self.win.workspace.refresh()
+        self.assertTrue(self.win.home.sync_btn.isVisible())
         click(self.win.home.sync_btn)
         self.idle()
         self.assertIsNot(self.win.session, before)
@@ -2487,7 +2493,7 @@ class ThemeTest(GuiTest):
                     self.assertEqual([key for key, button in hub.text_buttons.items() if button.isChecked()], [step])
                     for button in buttons:
                         self.assertGreaterEqual(button.width(), button.fontMetrics().horizontalAdvance(button.text()) + 28)
-                        self.assertTrue(hub.settings_panel.rect().contains(button.geometry()))
+                        self.assertTrue(hub.settings_panel.rect().contains(button.rect().translated(button.mapTo(hub.settings_panel, QPoint()))))
                     if step in widths:
                         self.assertEqual(buttons[0].width(), widths[step])
                     widths[step] = buttons[0].width()

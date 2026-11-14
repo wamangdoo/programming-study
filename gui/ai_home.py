@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
-"""AI 비전 개론 홈(AiHomePage)과 차시 화면(AiLessonPage).
+"""AI 개론·응용 홈과 차시별 학습 목록을 구성함.
 
-홈: 위 막대(← 처음 화면), 제목과 세 단계 안내(단원 읽기, 그 단원 문항 풀기, 다음 날부터 복습), 알림 줄(시험까지 남은 날, 오늘 푼 문항,
-외운 문항), 이어서 할 일 카드(화면에 하나뿐인 주 단추), 학습 단원 구역(차시마다 한 줄, 준비 중인 차시는 끝의 글자 단추 하나로 접음),
-문제집 구역(복습 문항과 외운 문항의 낱말 풀이, 섞어 풀기, 공개된 차시마다 차시 문제집, 오답 노트), 상황별 코드 구역(공개된 단원마다 한 줄,
-준비 중 단원은 같은 꼴로 접음). 읽기가 풀기보다 먼저라 학습 단원을 문제집 위에 둠. 상황별 코드 단원은 권하는 차시를 읽은 뒤에
-읽고(학습 루프는 6차시 뒤) 이어서 할 일 카드도 그때 권하므로 맨 아래에 둠. 하루 목표는 두지 않고(2026-11-03 사용자 결정) 문제집을
-원하는 만큼 풀게 함. 문제집 줄은 외운 문항과 복습 문항을, 학습 단원 줄은 읽은 단원 수를, 상황별 코드 줄은 권하는 차시와 외운 문항·복습
-(안 읽었으면 읽는 시간)을 씀. 상황별 코드 단원은 권하는 차시를 읽기 전에도 열 수 있음.
-모의고사 구역은 문항이 공개된 회차만 보임.
-차시 화면: 단원 줄, [전체 노트]·[외울 것], 아래 막대의 [이 차시 풀기]. 수치는 모두 AiSession 이 계산한 값이고 화면 글은 gui/ai_text.py 가 만듦."""
+읽던 단계, 단원 연습, 날짜를 띄운 복습 기록을 구분해 표시함.
+상황별 코드와 모의고사는 현재 과정에 공개된 항목만 표시함.
+혼합 모의고사는 두 탭에서 같은 응시 기록을 사용함."""
 from PyQt6.QtWidgets import QWidget
 
-from aiprep import bank
+from aiprep import bank, mixed_mock
 from gui import ai_text, kit, theme
 from gui.wrong_page import count_line
 from session import SessionError
@@ -49,7 +43,7 @@ class AiHomePage(QWidget):
         root.addWidget(kit.heading(kit.label(ai_text.TRACK, "title"),
                                    guide_line))
         root.addSpacing(theme.GAP["description_content"])
-        self.course_tabs = kit.TabBar(["개론", "응용"])
+        self.course_tabs = kit.TabBar(["개론", "응용"], deferred=True)
         self.course_tabs.setAccessibleName("AI 학습 과정")
         self.course_tabs.picked.connect(lambda n: self.win.switch_ai_course(("intro", "app")[n]))
         root.addWidget(self.course_tabs)
@@ -101,6 +95,8 @@ class AiHomePage(QWidget):
         mock_box.addSpacing(theme.GAP["description_content"])
         self.mock_list = kit.RowList()
         mock_box.addWidget(self.mock_list)
+        self.mock_pending = kit.para('', 'body', 'secondary')
+        mock_box.addWidget(self.mock_pending)
         root.addWidget(self.mock_section)
         root.addStretch(1)
         column = kit.column(inner)
@@ -165,7 +161,10 @@ class AiHomePage(QWidget):
     def show_mocks(self, overview):
         self.mock_list.clear()
         rows = [row for row in overview['mocks'] if row['ready']]
-        self.mock_section.setVisible(bool(rows))
+        pending = overview.get('mock_pending', '')
+        self.mock_pending.setText(pending)
+        self.mock_pending.setVisible(bool(pending))
+        self.mock_section.setVisible(bool(rows) or bool(pending))
         for spec in rows:
             state = self.win.ai.mock_state(spec['id'])
             end = '풀기 전'
@@ -175,8 +174,9 @@ class AiHomePage(QWidget):
                 end = '남은 시간 %d분' % ((state['remaining'] + 59) // 60)
             elif state['first_score'] is not None:
                 end = '%d / %d' % (state['first_score'], spec['count'])
-            row = self.mock_list.add(kit.Row(spec['title'], '%d문항 · %d분 · %d~%d차시' %
-                                            (spec['count'], spec['minutes'], spec['range'][0], spec['range'][1]), end=end))
+            detail = mixed_mock.description(spec) if mixed_mock.candidate(spec) else '%d문항 · %d분 · %d~%d차시' % (
+                spec['count'], spec['minutes'], spec['range'][0], spec['range'][1])
+            row = self.mock_list.add(kit.Row(spec['title'], detail, end=end))
             if state['error']:
                 row.setToolTip(state['error'])
             row.clicked.connect(lambda checked=False, mid=spec['id']: self.win.open_ai_mock(mid))
@@ -318,9 +318,10 @@ class AiLessonPage(QWidget):
         self.top = kit.TopBar("← AI 비전 개론", "")
         self.back_btn, self.title = self.top.back, self.top.title
         self.note_btn = self.top.add_right(kit.button("전체 노트", "text", "s"))
-        self.memo_btn = self.top.add_right(kit.button("외울 것", "text", "s"), flush=True)
+        self.memo_btn = self.top.add_right(kit.button("복습 질문", "text", "s"), flush=True)
         self.note_btn.setToolTip("이 차시의 모든 단원을 정답을 편 채로 다시 읽습니다. 다시 읽기는 복습 확인 기록으로 세지 않습니다.")
-        self.memo_btn.setToolTip("이 차시 모든 단원의 외울 것을 답을 가린 질문으로 모아 봅니다.")
+        self.memo_btn.setToolTip("이 차시의 복습 질문을 모아 엽니다. 질문을 누르면 답이 펼쳐집니다.")
+        self.memo_btn.setAccessibleDescription(self.memo_btn.toolTip())
         outer.addWidget(self.top)
         inner = QWidget()
         root = kit.box(inner, (0, 24, 0, 48))

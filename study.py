@@ -835,7 +835,10 @@ def in_open_round(key):
     """풀고 있는(제출 전) 회차에 든 문항인지 봄. 화면처럼 그런 문항의 해설은 열지 않음."""
     import adaptive
     import session
-    user = session.saved_user()
+    try:
+        user = session.saved_user()
+    except session.SessionError as error:
+        die(str(error))
     if not user:
         return False
     try:
@@ -1043,7 +1046,7 @@ def build_parser():
     if "web" in ENTRY_TRACKS:
         sub.add_parser("web", help="웹 면접 준비: python study.py web --help", add_help=False)
 
-    for name, title, track in (("ai-data", "AI 비전 개론", "ai"), ("python-data", "파이썬", "python")):
+    for name, title, track in (("ai-data", "AI 개론·응용", "ai"), ("python-data", "파이썬", "python")):
         p = sub.add_parser(name, help=title + " 추가 학습 데이터 관리")
         p.add_argument("action", choices=("status", "enable", "disable", "export", "delete"), nargs="?", default="status")
         p.add_argument("--user")
@@ -1056,7 +1059,7 @@ def build_parser():
     p.add_argument("--user")
     p.set_defaults(func=cmd_go)
 
-    p = sub.add_parser("update", help="새 버전과 새 문제 받기 (화면이 열리지 않을 때)")
+    p = sub.add_parser("update", help="새 버전과 프로그램 업데이트 (화면이 열리지 않을 때)")
     p.add_argument("--user")
     p.set_defaults(func=cmd_update)
 

@@ -10,11 +10,11 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
-import tempfile
 import uuid
 import urllib.parse
 
 from learning_data.collection import FORMAT, NOTICE, inside, packed
+from learning_data.generation import from_item as generation_from_item
 
 MAX_BODY = 1024 * 1024
 MAX_EVENTS = 100
@@ -89,13 +89,19 @@ class Database:
             db.close()
 
     def invites(self, count=1, days=7):
+        with self.prepare_invites(count, days) as codes:
+            return codes
+
+    @contextlib.contextmanager
+    def prepare_invites(self, count, days):
+        """파일 준비가 성공한 뒤에만 새 초대 코드를 등록함."""
         if not 1 <= count <= 200 or not 1 <= days <= 30:
             raise ValueError("초대 수는 1~200, 유효 기간은 1~30일로 지정해 주세요.")
         expires = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
         codes = [secrets.token_urlsafe(24) for _ in range(count)]
+        yield codes
         with self.connect() as db:
             db.executemany("INSERT INTO invites VALUES (?, ?, NULL)", [(hashed(code), expires) for code in codes])
-        return codes
 
     def health(self):
         with contextlib.closing(sqlite3.connect(Path(self.path).as_uri() + "?mode=ro", uri=True)) as db:
@@ -193,6 +199,15 @@ class Database:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT 1 FROM participants WHERE participant=? AND revoked=0", (participant,)).fetchone():
                 raise ApiError(401, "철회한 참가자입니다.")
+            previous = db.execute("SELECT receipt FROM open_enrollments WHERE participant=?", (participant,)).fetchone()
+            old_scope = json.loads(previous[0]).get("automatic_submission") if previous and previous[0] else None
+            new_scope = consent.get("automatic_submission")
+            if old_scope is not None:
+                if new_scope is None:
+                    consent["automatic_submission"] = old_scope
+                elif (datetime.datetime.fromisoformat(new_scope["at"]) < datetime.datetime.fromisoformat(old_scope["at"]) or
+                      (new_scope["at"] == old_scope["at"] and not old_scope["accepted"] and new_scope["accepted"])):
+                    raise ApiError(409, "이전 자동 제출 설정입니다. 현재 설정을 다시 보내 주세요.")
             db.execute("INSERT INTO open_enrollments VALUES (?, 'research', ?, ?, NULL) "
                        "ON CONFLICT(participant) DO UPDATE SET receipt=excluded.receipt",
                        (participant, packed(consent), datetime.datetime.now(datetime.timezone.utc).isoformat()))
@@ -250,6 +265,13 @@ class Database:
             revision = row.get("item_revision")
             if revision is not None and (not re.fullmatch(r"[a-f0-9]{64}", str(revision)) or not isinstance(row.get("item"), dict)):
                 raise ApiError(400, "문항 버전과 지문을 확인해 주세요.")
+            if isinstance(row.get("item"), dict) and row["item"].get("generation") is not None:
+                try:
+                    if track != "ai" or revision is None:
+                        raise ValueError("생성 문항의 과목과 버전을 확인해 주세요.")
+                    generation_from_item(row["item"])
+                except ValueError as error:
+                    raise ApiError(400, str(error)) from error
             cleaned.append((participant, track, row["event_id"], seq, packed(row)))
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -290,38 +312,8 @@ class Database:
             db.execute("DELETE FROM submission_accounts WHERE participant=?", (participant,))
 
     def export(self, destination, include_answers=False):
-        if inside(destination, REPOSITORY) or inside(destination, os.path.dirname(self.path)):
-            raise ValueError("공개 저장소와 서버 데이터 폴더 밖의 새 파일을 골라 주세요.")
-        if os.path.lexists(destination):
-            raise ValueError("이미 있는 파일입니다. 다른 이름을 골라 주세요.")
-        fd, temp = tempfile.mkstemp(prefix=".dataset-", dir=os.path.dirname(os.path.abspath(destination)))
-        try:
-            expected, count = hashlib.sha256(), 0
-            with self.connect() as db, os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
-                db.execute("BEGIN")
-                for row in db.execute("SELECT payload FROM events ORDER BY participant, track, sequence"):
-                    value = json.loads(row[0])
-                    value.setdefault("synthetic", False)
-                    if not include_answers:
-                        value["data"].pop("response", None)
-                    line = packed(value) + "\n"
-                    output.write(line)
-                    expected.update(line.encode("utf-8"))
-                    count += 1
-                output.flush()
-                os.fsync(output.fileno())
-            actual = hashlib.sha256()
-            with open(temp, "rb") as saved:
-                for line in saved:
-                    json.loads(line)
-                    actual.update(line)
-            if actual.digest() != expected.digest():
-                raise ValueError("내보낸 파일의 내용을 확인하지 못했습니다.")
-            os.link(temp, destination)
-            return {"events": count, "sha256": actual.hexdigest()}
-        finally:
-            if os.path.exists(temp):
-                os.unlink(temp)
+        from learning_server.operations import export
+        return export(self.path, destination, include_answers)
 
 
 def identifier(value):
@@ -407,6 +399,16 @@ def application(database, *, legacy_contract=False):
                         allowed = db.execute("SELECT 1 FROM open_enrollments WHERE participant=? AND purpose='private_submission' AND withdrawn IS NULL", (participant,)).fetchone()
                     if not allowed:
                         raise ApiError(403, "비공개 풀이 제출 연결이 필요합니다.")
+                    if type(data.get("automatic", False)) is not bool:
+                        raise ApiError(400, "자동 제출 여부를 확인해 주세요.")
+                    if data.get("automatic"):
+                        from learning_data.privacy import validate_receipt
+                        with database.connect() as db:
+                            saved = db.execute("SELECT receipt FROM open_enrollments WHERE participant=?", (participant,)).fetchone()
+                        try:
+                            validate_receipt(json.loads(saved[0]), automatic=True)
+                        except (ValueError, TypeError):
+                            raise ApiError(403, "자동 제출 안내에 동의한 기록이 필요합니다.") from None
                     result = submissions.store(participant, data)
                 elif path == "/v1/submissions":
                     result = submissions.store(participant, data)

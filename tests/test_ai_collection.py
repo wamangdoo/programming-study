@@ -243,6 +243,29 @@ class CollectionIntegrationTest(Base):
         self.assertEqual(first["at"], row["prediction_at"])
         self.assertEqual(first["event_id"], row["prediction_event"])
 
+    def test_runtime_change_keeps_raw_answer_without_guessing_return_time(self):
+        from learning_server.dataset import prepare
+        sess = self.session()
+        sess.collection.set_enabled(True)
+        sess.mark_read('i90', '90a')
+        with mock.patch.object(collection, 'runtime_revision', return_value='before-update'):
+            practice = sess.start_set('unit', lesson='i90', unit='90a', seed=4)
+            current = practice.current()
+            saved = practice.snapshot()
+        before = sess.collection.snapshot()
+        first = next(row for row in before if row['kind'] == 'question_returned')
+        with mock.patch.object(collection, 'runtime_revision', return_value='after-update'):
+            restored = service.PracticeSet.restore(sess, saved)
+            restored.current()
+            restored.answer(self.right(restored, current), 3, False)
+        after = sess.collection.snapshot()
+        self.assertEqual(first, next(row for row in after if row['kind'] == 'question_returned'))
+        answer = next(row for row in after if row['kind'] == 'answer')
+        self.assertNotEqual(first['item_revision'], answer['item_revision'])
+        prepared = prepare(after)[0]
+        self.assertIsNone(prepared['prediction_at'])
+        self.assertIsNone(prepared['prediction_event'])
+
     def test_mock_submission_records_missing_and_answered_items_once(self):
         helper = mock_tests.MockServiceTest("test_unsubmitted_questions_do_not_enter_practice")
         helper.setUp()
@@ -261,11 +284,46 @@ class CollectionIntegrationTest(Base):
         rows = self.events(sess, "mock_answer")
         self.assertEqual(4, len(rows))
         self.assertEqual(3, sum(row["result"] == "blank" for row in rows))
+        exported = [row["data"] for row in sess.collection.snapshot() if row["kind"] == "mock_answer"]
+        self.assertEqual([row["card"] == "m90-01" for row in exported], [row["answered"] for row in exported])
+        self.assertTrue(all("response" not in row for row in exported))
         self.assertTrue(all(row["secs"] is None for row in rows))
         self.assertEqual(1, len(self.events(sess, "mock_question_returned")))
         snapshots = [row["item"] for row in sess.collection.snapshot() if row["kind"] in ("mock_question_returned", "mock_answer")]
         self.assertEqual(5, len(snapshots))
         self.assertTrue(all(item["difficulty"] == 2 for item in snapshots))
+
+    def test_mock_input_counts_only_persisted_changes_in_the_same_consent_period(self):
+        helper = mock_tests.MockServiceTest("test_unsubmitted_questions_do_not_enter_practice")
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        sess = helper.session()
+        sess.collection.set_enabled(True)
+        exam = sess.start_mock("m90", seed=1)
+        cid = "m90-01"
+        exam.save_answer([""], cid)
+        exam.save_answer(["a"], cid, flush=False)
+        exam.save_answer([""], cid)
+        self.assertEqual([], self.events(sess, "ai_input"))
+        exam.save_answer(["a"], cid, flush=False)
+        exam.save_answer(["ab"], cid, flush=False)
+        with mock.patch.object(study, "write_text", side_effect=OSError("full")), self.assertRaises(mock_tests.MockError):
+            exam.save_answer(["abc"], cid)
+        self.assertEqual([], self.events(sess, "ai_input"))
+        exam.save_answer(["answer-marker"], cid)
+        exam.save_answer(["answer-marker"], cid)
+        sess.start_mock("m90").save_answer(["answer-marker"], cid)
+        exam.save_answer(["b"], cid, flush=False)
+        sess.collection.set_enabled(False)
+        sess.collection.set_enabled(True)
+        exam.move(0)
+        rows = self.events(sess, "ai_input")
+        self.assertEqual(1, len(rows))
+        self.assertEqual({"input_schema", "card", "mock", "try", "course", "goal", "observed_at"}, set(rows[0]))
+        self.assertEqual(1, rows[0]["input_schema"])
+        exported = [r for r in sess.collection.snapshot() if r["kind"] == "ai_input"]
+        self.assertNotIn("answer-marker", json.dumps(exported))
+        self.assertIsNone(exported[0]["item_revision"])
 
     def test_real_mock_events_link_return_time_without_same_exam_labels(self):
         from learning_server.dataset import prepare
@@ -299,6 +357,7 @@ class CollectionIntegrationTest(Base):
         result = exam.submit()
         rows = self.events(sess, "mock_answer")
         self.assertEqual("not_collected", next(row["result"] for row in rows if row["card"] == "m90-01"))
+        self.assertNotIn("answered", next(row for row in rows if row["card"] == "m90-01"))
         self.assertNotIn("BEFORE_CONSENT", json.dumps(rows))
         self.assertEqual("stuck", result["results"]["m90-01"])
         self.assertEqual(["BEFORE_CONSENT"], exam.draft["answers"]["m90-01"])

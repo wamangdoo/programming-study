@@ -24,7 +24,7 @@ import threading
 import adaptive
 import session
 import study
-from aiprep import bank, gen, grade, mock, notes, plan, review, skel
+from aiprep import bank, gen, grade, mixed_mock, mock, notes, plan, review, skel
 from learning_data import collection
 from webprep import record
 
@@ -129,6 +129,7 @@ class AiSession(object):
         self.root = root or bank.AI_DIR
         self.folder = os.path.join(study.SUBMISSIONS_DIR, user, "ai")
         self.home = os.path.join(home or home_dir(), user)
+        self.mock_home = self.home
         self.collection = collection.Collection(self.home, study.ROOT)
         try:
             self.collection.initialize_distribution()
@@ -146,9 +147,24 @@ class AiSession(object):
             self.terms = bank.read_terms(self.root)
         except bank.AiBankError as error:
             raise AiError("AI 비전 개론 목록을 읽을 수 없습니다. %s" % error)
+        self.mock_lessons = {e["id"]: e for e in self.index["lessons"]}
+        pending_mocks, accepted_mocks = {}, []
+        for spec in self.index["mocks"]:
+            if mixed_mock.candidate(spec):
+                try:
+                    mixed_mock.validate(spec, study.read_json(os.path.join(bank.mock_dir(spec["id"], self.root), "meta.json")))
+                except (OSError, ValueError, TypeError) as error:
+                    pending_mocks[spec["id"]] = str(error)
+                    continue
+            elif course != "intro":
+                continue
+            accepted_mocks.append(spec)
+        self.index["mocks"] = accepted_mocks
+        if os.path.isfile(os.path.join(bank.mock_dir("m4", self.root), "meta.json")) and not any(m["id"] == "m4" for m in accepted_mocks):
+            pending_mocks.setdefault("m4", "혼합 모의고사의 문항 검토와 목록 연결을 준비하고 있습니다.")
         self.index["lessons"] = [e for e in self.index["lessons"] if e["course"] == course]
         if course != "intro":
-            self.index["patterns"], self.index["mocks"] = [], []
+            self.index["patterns"] = []
             self.index["exam"] = {}
         self.exam = review.exam_dates(self.index["exam"])
         self.term_map = grade.term_map(self.terms)
@@ -156,6 +172,8 @@ class AiSession(object):
         self.lessons = {e["id"]: e for e in self.index["lessons"]}
         self.mocks = {e["id"]: e for e in self.index["mocks"]}
         self.notes, self.items, self.cards, self.errors = {}, {}, {}, {}
+        self.errors.update(pending_mocks)
+        self.mock_pending = pending_mocks
         try:
             bank.load_common(self.root)
         except bank.AiBankError as error:
@@ -186,9 +204,21 @@ class AiSession(object):
         self._index, self._index_log = None, None
         self._gen_kind = {}
         self._content_versions_cache = None
+        self._card_versions_cache = None
         self._active_set = None
         self._mock_loaded = set()
         self._mock_exams = {}
+        self._recover_mocks()
+
+    def resume_course(self):
+        """자료는 재사용하고 다른 과정에서 바뀐 기록·연습·모의고사를 다시 읽음."""
+        self._content_versions_cache = None
+        self._cache_key, self._index = None, None
+        self._active_set = None
+        for key in ("card_versions", *self.mocks):
+            self.errors.pop(key, None)
+        self._state()
+        self._mock_exams.clear()
         self._recover_mocks()
 
     def _recover_mocks(self):
@@ -202,8 +232,8 @@ class AiSession(object):
             if mid not in self.mocks or (mid, int(row.get('try') or 1)) in done:
                 continue
             try:
-                self._mock_exams[mid] = mock.MockExam(self, mid, clock=lambda: now(), submit_expired=False)
-            except mock.MockError as error:
+                self.start_mock(mid, _submit_expired=False)
+            except AiError as error:
                 self.errors[mid] = str(error)
         self.expire_mocks()
 
@@ -222,7 +252,7 @@ class AiSession(object):
         if mid not in self.mocks:
             raise AiError('모의고사를 찾을 수 없습니다.')
         try:
-            items, fingerprint = mock.load_items(self.root, self.mocks[mid])
+            items, fingerprint = mock.load_items(self.root, self.mocks[mid], self.mock_lessons)
             rows = mock.submissions(self.record.reload(), mid)
         except (mock.MockError, record.RecordError) as error:
             raise AiError(str(error)) from error
@@ -252,11 +282,13 @@ class AiSession(object):
             if mid in self._mock_loaded or mid not in self.mocks:
                 continue
             try:
-                items, fingerprint = mock.load_items(self.root, self.mocks[mid])
+                items, fingerprint = mock.load_items(self.root, self.mocks[mid], self.mock_lessons)
                 if row.get('fingerprint') != fingerprint:
                     raise mock.MockError('제출한 뒤 문제 자료가 바뀌었습니다. 이전 결과와 답안은 보존했습니다.')
                 cards = bank.cards_of({'id': mid}, {'items': list(items.values()), 'topics': [], 'gens': []})
                 for card in cards:
+                    if mixed_mock.candidate(self.mocks[mid]) and card["item"]["course"] != self.course:
+                        continue
                     if row.get('results', {}).get(card['id']) not in ('stuck', 'blank', 'partial'):
                         continue
                     card['mock'], card['after'] = mid, card['item'].get('lesson')
@@ -312,7 +344,7 @@ class AiSession(object):
 
     def course_log(self):
         """원본 기록을 보존하고 현재 과정의 계산용 줄만 고름."""
-        return [e for e in self.record.log if e.get("course", bank.course_of(e.get("lesson") or e.get("card"))) == self.course]
+        return [row for e in self.record.log if (row := mixed_mock.course_entry(e, self.course)) is not None]
 
     def unit_name(self, lid, key):
         """단원 이름 한 규칙. 차시는 "5차시 · 단원 제목", 상황별 코드는 "학습 루프 · 단원 제목"(index 단원 name). 단원 제목을
@@ -337,6 +369,49 @@ class AiSession(object):
     def today(self):
         return _today()
 
+    def _card_versions(self):
+        """자료가 같은 세션에서는 문항 본문·용어의 해시를 재사용함."""
+        if self._card_versions_cache is not None:
+            return self._card_versions_cache
+        versions, sources = {}, {}
+        metadata = {"order", "ref", "errata", "prio", "core", "deep", "level", "tags", "facts", "step",
+                    "unit", "family", "confuse", "after"}
+        def content_only(value):
+            if isinstance(value, dict):
+                return {key: content_only(item) for key, item in value.items() if key not in metadata}
+            if isinstance(value, (list, tuple)):
+                return [content_only(item) for item in value]
+            return value
+        for cid, card in self.cards.items():
+            if card.get("mock"):
+                continue
+            content = dict(card)
+            content.pop("gen", None)
+            source_text = []
+            if card["kind"] == "gen":
+                spec = card["gen"]
+                hashes = []
+                for source in (spec.path, os.path.join(self.root, "items", "common", "gens.py")):
+                    if source not in sources:
+                        try:
+                            with open(source, "rb") as stream:
+                                raw = stream.read()
+                            sources[source] = hashlib.sha256(raw).hexdigest(), raw.decode("utf-8", errors="replace")
+                        except OSError:
+                            sources[source] = None, ""
+                    checksum, text = sources[source]
+                    hashes.append(checksum)
+                    source_text.append(text)
+                content["generator"] = {"id": spec.id, "meta": spec.meta, "doc": spec.doc, "sources": hashes}
+            if card["kind"] == "skel":
+                content["skeleton"] = self.skeletons.get(card["pattern"])
+            content = content_only(content)
+            text = grade.norm("word", collection.packed(content) + " ".join(source_text))
+            terms = {key: sorted(values) for key, values in self.term_map.items() if key in text}
+            versions[cid] = collection.digest({"card": content, "terms": terms})
+        self._card_versions_cache = versions
+        return versions
+
     def _content_versions(self):
         """현재 문항과 이전에 관찰한 문항을 대조함. 원래 답 기록은 바꾸지 않음."""
         with self._lock:
@@ -353,44 +428,10 @@ class AiSession(object):
                 self.errors["card_versions"] = "문항 변경 기록을 읽지 못했습니다. 원본을 보관하고 스터디장에게 알려 주세요."
             saved = local.get("card_versions", {})
             saved = saved if isinstance(saved, dict) else {}
-            versions, revised, sources = {}, set(), {}
-            metadata = {"order", "ref", "errata", "prio", "core", "deep", "level", "tags", "facts", "step",
-                        "unit", "family", "confuse", "after"}
-            def content_only(value):
-                if isinstance(value, dict):
-                    return {key: content_only(item) for key, item in value.items() if key not in metadata}
-                if isinstance(value, (list, tuple)):
-                    return [content_only(item) for item in value]
-                return value
-            for cid, card in self.cards.items():
-                if card.get("mock"):
-                    continue
-                content = dict(card)
-                content.pop("gen", None)
-                source_text = []
-                if card["kind"] == "gen":
-                    spec = card["gen"]
-                    hashes = []
-                    for source in (spec.path, os.path.join(self.root, "items", "common", "gens.py")):
-                        if source not in sources:
-                            try:
-                                with open(source, "rb") as stream:
-                                    raw = stream.read()
-                                sources[source] = hashlib.sha256(raw).hexdigest(), raw.decode("utf-8", errors="replace")
-                            except OSError:
-                                sources[source] = None, ""
-                        checksum, text = sources[source]
-                        hashes.append(checksum)
-                        source_text.append(text)
-                    content["generator"] = {"id": spec.id, "meta": spec.meta, "doc": spec.doc, "sources": hashes}
-                if card["kind"] == "skel":
-                    content["skeleton"] = self.skeletons.get(card["pattern"])
-                content = content_only(content)
-                text = grade.norm("word", collection.packed(content) + " ".join(source_text))
-                terms = {key: sorted(values) for key, values in self.term_map.items() if key in text}
-                versions[cid] = collection.digest({"card": content, "terms": terms})
+            versions, revised = self._card_versions(), set()
+            for cid, revision in versions.items():
                 previous = saved.get(cid, {})
-                if isinstance(previous, dict) and (previous.get("changed") or previous.get("revision") not in (None, versions[cid])):
+                if isinstance(previous, dict) and (previous.get("changed") or previous.get("revision") not in (None, revision)):
                     revised.add(cid)
             for entry in self.course_log():
                 cid, revision = entry.get("card"), entry.get("content_revision")
@@ -568,21 +609,32 @@ class AiSession(object):
 
     # 기록
 
-    def collect_event(self, kind, data, item=None, key=None, at=None, *, observation_context=collection.CURRENT_CONTEXT):
+    def collect_event(self, kind, data, item=None, key=None, at=None, *, observation_context=collection.CURRENT_CONTEXT, _mock_exam=None):
         """동의한 뒤의 추가 데이터만 저장함. 과거 제출 기록은 가져오지 않음."""
         if not os.path.exists(self.collection.path):
             return
         try:
             status = self.collection.status()
             if status["enabled"]:
-                data = dict(data, course=self.course)
+                observed_course = self.course
+                if _mock_exam is not None:
+                    observed_course = mixed_mock.collection_course(_mock_exam, self, kind, data)
+                    data = dict(data, scope="mixed")
+                    data.update(seed=_mock_exam.draft["seed"], blueprint_revision=_mock_exam.spec["blueprint_revision"])
+                    if data.get("card"):
+                        item = _mock_exam.collection_item(data["card"])
+                        data["course_no"] = self.mock_lessons[_mock_exam.items[data["card"]]["lesson"]]["no"]
+                elif data.get("scope") == "mixed":
+                    data = {k: v for k, v in data.items() if k != "scope"}
+                data = dict(data, course=observed_course)
                 item = item() if callable(item) else item
                 if item is not None:
                     item = copy.deepcopy(item)
                     content = item["content"]
-                    content["course"] = self.course
-                    content["course_no"] = self.lessons.get(content.get("lesson"), {}).get("no")
-                    item["revision"] = collection.digest({"revision": item["revision"], "course": self.course,
+                    content["course"] = observed_course
+                    entries = self.mock_lessons if _mock_exam is not None else self.lessons
+                    content["course_no"] = entries.get(content.get("lesson"), {}).get("no")
+                    item["revision"] = collection.digest({"revision": item["revision"], "course": observed_course,
                                                           "course_no": content["course_no"]})
                 self.collection.emit(kind, data, item, key=key, at=at,
                                      observation_context=observation_context)
@@ -591,6 +643,18 @@ class AiSession(object):
         except (ValueError, KeyError, TypeError, OSError, collection.CollectionError) as error:
             self.collection.error = "추가 학습 데이터의 문항 정보를 저장하지 못했습니다. %s" % error
             self.collection.missed += 1
+
+    def _collect_mixed_record(self, exam, row, *, observation_context=collection.CURRENT_CONTEXT):
+        """회차의 묶음 공개를 과정별 집계로 나누고 같은 공개 시각을 유지함."""
+        for course in exam.spec["courses"]:
+            data = {k: v for k, v in row.items() if k != "at"}
+            data["course"] = course
+            if row["kind"] == "mock_submit":
+                data["results"] = {cid: result for cid, result in row["results"].items() if exam.items[cid]["course"] == course}
+                data.update(of=len(data["results"]), score=sum(v == "pass" for v in data["results"].values()), related=[])
+                data["omitted_before_consent"] = sum(i["course"] == course for i in exam.items.values()) - len(data["results"])
+            key = "mixed-record:%s:%d:%s:%s:%s" % (exam.id, exam.attempt, exam.fingerprint, row["kind"], course)
+            self.collect_event(row["kind"], data, key=key, at=row["at"], observation_context=observation_context, _mock_exam=exam)
 
     def _collect_record(self, row, private=None, item=None, *, observation_context=collection.CURRENT_CONTEXT):
         data = {key: value for key, value in row.items() if key not in ("at", "value", "picked", "also_value", "content_revision", "content_revisions")}
@@ -697,7 +761,8 @@ class AiSession(object):
         try:
             study.write_text(os.path.join(self.home, "state.json"), json.dumps(data, ensure_ascii=False, indent=1) + "\n")
         except OSError:
-            pass  # 중간 자리는 편의라 못 써도 학습은 이어감
+            return False  # 중간 자리는 편의라 못 써도 학습은 이어감
+        return True
 
     def completed_units(self):
         """끝낸 단원 연습 묶음을 셈. 읽기 기록이나 마지막 단계 진입으로 완료를 추정하지 않음."""
@@ -781,7 +846,7 @@ class AiSession(object):
             data["continuation"] = {"kind": "practice", "at": now()}
             if practice.lesson and practice.unit:
                 data["last_unit"] = [practice.lesson, practice.unit]
-        self._save_local(data)
+        return self._save_local(data)
 
     # 카드
 
@@ -831,12 +896,26 @@ class AiSession(object):
         """자동 복습 후보 유무와 다음 복습 날짜를 돌려줌. 기록은 남기지 않음."""
         return self._state().review_status()
 
-    def start_mock(self, mid, repeat=False, seed=None, clock=None, monotonic=None):
+    def start_mock(self, mid, repeat=False, seed=None, clock=None, monotonic=None, _submit_expired=True):
         """회차를 시작하거나 로컬 초안을 이어 엶. 제출한 회차는 결과를 열고 repeat이면 새 풀이를 시작함."""
         try:
+            if mid in self.mocks and mixed_mock.candidate(self.mocks[mid]):
+                with mixed_mock.lock(self, mid):
+                    _, fingerprint = mock.load_items(self.root, self.mocks[mid], self.mock_lessons)
+                    exam = mixed_mock.cached(self, mid)
+                    starts = [r for r in self.record.reload() if r.get("kind") == "mock_start" and r.get("mock") == mid]
+                    latest = max((int(r.get("try") or 1) for r in starts), default=0)
+                    if repeat or exam is None or exam.fingerprint != fingerprint or exam.attempt != latest:
+                        exam = mock.MockExam(self, mid, repeat=repeat, seed=seed, clock=clock or (lambda: now()),
+                                             monotonic=monotonic, submit_expired=_submit_expired)
+                        mixed_mock.remember(self, exam)
+                    self._mock_exams[mid] = exam
+                    self.errors.pop(mid, None)
+                    return exam
             if not repeat and mid in self._mock_exams:
                 return self._mock_exams[mid]
-            exam = mock.MockExam(self, mid, repeat=repeat, seed=seed, clock=clock or (lambda: now()), monotonic=monotonic)
+            exam = mock.MockExam(self, mid, repeat=repeat, seed=seed, clock=clock or (lambda: now()), monotonic=monotonic,
+                                 submit_expired=_submit_expired)
             self._mock_exams[mid] = exam
             self.errors.pop(mid, None)
             return exam
@@ -1049,7 +1128,7 @@ class _LogIndex(object):
         for day, count in activity_counts(entries).items():
             self.all_activity[day] = self.all_activity.get(day, 0) + count
         self.all_recent = (recent_lines(entries, with_course=True, first_mocks=self.all_first_mocks) + self.all_recent)[:5]
-        entries = [e for e in entries if e.get("course", bank.course_of(e.get("lesson") or e.get("card"))) == self.course]
+        entries = [row for e in entries if (row := mixed_mock.course_entry(e, self.course)) is not None]
         self.events.feed(entries)
         for e in entries:
             kind = e.get("kind")
@@ -1368,11 +1447,11 @@ class _State(object):
         plan_row = self.plan()
         counts = self.notes()[1]
         activity = activity_counts(self.log)
-        mocks = [{"id": m["id"], "title": m["title"], "minutes": m["minutes"], "count": m["count"], "range": m["range"],
-                  "window": m["window"], "ready": os.path.isfile(os.path.join(bank.mock_dir(m["id"], sess.root), "meta.json"))}
+        mocks = [dict(m, ready=os.path.isfile(os.path.join(bank.mock_dir(m["id"], sess.root), "meta.json")))
                  for m in sess.index["mocks"]]
         last_at = max((str(e.get("at") or "") for e in self.log), default=None) or None
-        return {"course": sess.course, "lessons": lessons, "patterns": self.pattern_rows(), "mocks": mocks, "due": len(due), "again": len(self.again),
+        return {"course": sess.course, "lessons": lessons, "patterns": self.pattern_rows(), "mocks": mocks,
+                "mock_pending": " ".join(sess.mock_pending.values()), "due": len(due), "again": len(self.again),
                 "today_answers": moved, "today_extra": max(0, len(today_rows) - moved),
                 "memorised": families_memorised(list(sess.cards.values()), self.sched, self.revised), "cards": len(sess.cards),
                 "families": len({c["family"] for c in sess.cards.values()}), "plan": plan_row, "next": self.next(plan_row, len(due)),
@@ -1516,12 +1595,12 @@ def cloze_item(statement):
             "explain": statement.get("why", "")}
 
 
-def _gen_trim(sess, chosen, keep=()):
-    """묶음이 작아졌을 때 생성기를 GEN_SHARE 아래로 줄임(뒤의 것부터). keep 의 카드는 빼지 않음."""
+def _gen_trim(sess, chosen, keep=(), minimum=0):
+    """묶음 크기에 맞춰 생성기를 뒤에서 줄임. minimum개와 keep의 문항은 남김."""
     while True:
         gens = [n for n, (c, _) in enumerate(chosen) if sess.cards[c]["kind"] == "gen"]
         spare = [n for n in gens if chosen[n][0] not in keep]
-        if not spare or len(gens) <= int(len(chosen) * GEN_SHARE):
+        if not spare or len(gens) <= max(minimum, int(len(chosen) * GEN_SHARE)):
             return chosen
         del chosen[spare[-1]]
 
@@ -1756,7 +1835,7 @@ def build_set(sess, state, mode, rng, lesson=None, unit=None, card=None, trace=N
     keep = {card} if mode == "note" else set()
     if mode in ("review", "sweep"):
         keep.update(cid for cid, pool in chosen if pool in ("again", "due"))
-    chosen = _gen_trim(sess, chosen, keep=keep)  # 직접 고른 문항과 예정일·미해결 생성기는 비율로 빼지 않음
+    chosen = _gen_trim(sess, chosen, keep=keep, minimum=1 if mode == "unit" else 0)
     if trace is not None:
         trace["selected_pools"] = dict(chosen)
         trace["selected_sources"] = {cid: "learner_choice" if mode == "note" and cid == card else "rules"
@@ -1802,8 +1881,8 @@ class PracticeSet(object):
         self.ended = False
         self.card, self.draft = None, {}
 
-    def fingerprint(self):
-        """묶음의 문항·용어·뼈대가 바뀌었는지 비교할 해시를 구함."""
+    def fingerprint(self, previous_refs=False):
+        """묶음 전체를 대조함. 출처 정정은 등록한 이전 ref로만 다시 계산함."""
         def generator(value):
             if not isinstance(value, gen.GenSpec):
                 raise TypeError(type(value).__name__)
@@ -1818,6 +1897,23 @@ class PracticeSet(object):
 
         content = {"cards": [self.sess.cards[c] for c in self.stats], "terms": self.sess.terms,
                    "skeletons": self.sess.skeletons}
+        if previous_refs:
+            cards, replaced = [], False
+            for card in content["cards"]:
+                fixes = self.sess.items.get(card.get("lesson"), {}).get("meta", {}).get("resume_source_refs", {})
+                fix = fixes.get(card["id"]) if isinstance(fixes, dict) else None
+                if fix is not None:
+                    if (not isinstance(fix, dict) or card["kind"] not in ("blank", "choice")
+                            or any(not isinstance(fix.get(key), list) or not all(isinstance(ref, str) for ref in fix[key])
+                                   for key in ("previous", "current"))
+                            or card.get("ref") != fix["current"] or card["item"].get("ref") != fix["current"]):
+                        return None
+                    card = dict(card, ref=fix["previous"], item=dict(card["item"], ref=fix["previous"]))
+                    replaced = True
+                cards.append(card)
+            if not replaced:
+                return None
+            content["cards"] = cards
         return hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True, default=generator).encode("utf-8")).hexdigest()
 
     def snapshot(self):
@@ -1843,7 +1939,9 @@ class PracticeSet(object):
         if not 0 <= result.pos < len(result.queue) or any(e["card"] not in sess.cards for e in result.queue):
             raise ValueError("문항이 바뀐 묶음")
         if saved["fingerprint"] != result.fingerprint():
-            raise ValueError("문항이 바뀐 묶음")
+            previous = result.fingerprint(previous_refs=True)
+            if previous is None or saved["fingerprint"] != previous:
+                raise ValueError("문항이 바뀐 묶음")
         result.before_due = {k: datetime.date.fromisoformat(d) if d else None for k, d in saved["before_due"].items()}
         result.sure_before = set(saved["sure_before"])
         result.rng = random.Random()
@@ -1876,7 +1974,10 @@ class PracticeSet(object):
             if entry["again"] and isinstance(item.get("alt"), dict):  # 묶음 안에서 다시 낼 때 바꿔 쓴 문항
                 item = dict(item, **item["alt"])
         elif card["kind"] == "gen":
+            source = bank.generation_source(card["gen"])
             item = gen.run(card["gen"], entry["seed"])
+            # 실제 생성 때의 소스를 초안에 보존함. 예전 캐시에는 값을 소급하지 않음.
+            item["_generation"] = source
         elif card["kind"] == "skel":
             item = self._skel_view(card, state, entry)
         elif view["form"] == "blank":
@@ -1929,7 +2030,7 @@ class PracticeSet(object):
                 "options": options, "pick": "right" if statement.get("ok") else "wrong", "multi": False,
                 "explain": statement.get("why", "")}
 
-    def current(self):
+    def current(self, *, measure_input=False):
         """지금 문항. 끝났으면 None. {"card", "kind", "chips", "stem", "blanks": [{"mode", "hint"}], "options": [{"no", "text"}],
         "multi", "pick", "code", "code_options"(보기가 코드), "grid"(보기 열 수 1·2), "again", "step", "lesson", "at", "total",
         "answered"}. chips 첫째는 자리 꼬리표(차시 "5차시", 상황별 코드는 단원 name), 둘째는 꼴."""
@@ -1961,7 +2062,8 @@ class PracticeSet(object):
             chips.append("심화")
         options = [{"no": n, "text": item["options"][n]["text"]} for n in view["order"]]
         self.sess.collect_event("question_returned", {"set": self.id, "card": card["id"], "position": self.pos,
-                                                     "again": entry["again"], "mode": self.mode},
+                                                     "again": entry["again"], "mode": self.mode,
+                                                     **({"input_schema": collection.AI_INPUT_SCHEMA} if measure_input else {})},
                                 item=lambda: self._collection_item(entry),
                                 key="question:%s:%d:%s:%d" % (self.id, self.pos, card["id"], entry["seed"]))
         return {"card": card["id"], "kind": form, "chips": chips, "stem": item.get("stem", ""),
@@ -2152,7 +2254,7 @@ class PracticeSet(object):
         self.sess.save_practice(self, activate=True)
         return self.answered
 
-    def next(self):
+    def next(self, *, measure_input=False):
         """다음 문항으로. 끝나면 set_end 를 기록하고 None."""
         if self.answered is None and self.pos < len(self.queue):
             raise AiError("답한 뒤에 넘어갈 수 있습니다.")
@@ -2165,7 +2267,7 @@ class PracticeSet(object):
                 self.sess.save_practice(self, activate=True)
                 return None
             self.draft = {}
-            item = self.current()
+            item = self.current(measure_input=measure_input)
             self.sess.save_practice(self, activate=True)
             return item
         except AiError:

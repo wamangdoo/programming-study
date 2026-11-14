@@ -8,7 +8,7 @@ import sys
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QFontMetricsF, QPalette
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QToolTip
 
 import mdlite
 
@@ -251,6 +251,9 @@ QWidget[ui="2"] QFrame#card QFrame#card { background: %(surface_alt)s; border-ra
 QWidget[ui="2"] QFrame#well { background: %(surface_alt)s; border: 0; border-radius: 12px; }
 QWidget[ui="2"] QFrame#team_metric, QWidget[ui="2"] QFrame#team_plot { background: %(surface)s; border: 1px solid %(line)s; border-radius: 16px; }
 QWidget[ui="2"] QFrame#team_breakdown, QWidget[ui="2"] QFrame#team_periods { background: %(surface_alt)s; border: 0; border-radius: 12px; }
+QWidget[ui="2"] QPushButton#metric_info { min-width: 0; min-height: 0; padding: 0; border: 2px solid transparent; border-radius: 8px; background: transparent; }
+QWidget[ui="2"] QPushButton#metric_info:hover { background: %(surface_alt)s; }
+QWidget[ui="2"] QPushButton#metric_info:focus { border-color: %(focus)s; }
 QWidget[ui="2"] QProgressBar#team_python, QWidget[ui="2"] QProgressBar#team_ai { background: %(track)s; border: 0; border-radius: 3px; }
 QWidget[ui="2"] QProgressBar#team_python::chunk { background: %(series_python)s; border-radius: 3px; }
 QWidget[ui="2"] QProgressBar#team_ai::chunk { background: %(series_ai)s; border-radius: 3px; }
@@ -301,6 +304,9 @@ QWidget[ui="2"] QPushButton#text[onbg="true"]:hover { background: %(line)s; }
 QWidget[ui="2"] QPushButton#text:pressed { background: %(track)s; }
 QWidget[ui="2"] QPushButton#text:disabled { background: transparent; color: %(faint)s; }
 QWidget[ui="2"] QPushButton#text:checked { background: %(selection)s; color: %(selection_ink)s; }
+QWidget[ui="2"] QPushButton#text[submission_action="true"][tone="accent"]:enabled { color: %(link)s; }
+QWidget[ui="2"] QPushButton#text[submission_action="true"][tone="accent"]:enabled:hover,
+QWidget[ui="2"] QPushButton#text[submission_action="true"][tone="accent"]:enabled:pressed { color: %(ink)s; }
 QWidget[ui="2"] QPushButton#danger { background: %(wrong_weak)s; color: %(wrong)s; }
 QWidget[ui="2"] QPushButton#danger:hover, QWidget[ui="2"] QPushButton#danger:pressed { background: %(wrong_weak)s; border-color: %(wrong)s; }
 QWidget[ui="2"] QPushButton#danger_text { background: transparent; color: %(wrong)s; padding: 0 12px; }
@@ -398,8 +404,8 @@ QFrame#submissionbar { background: %(surface)s; border: 1px solid %(border)s; bo
 QFrame#figure_controls { background: %(surface_alt)s; border: 1px solid %(border)s; border-radius: 12px; }
 QFrame#learning_activity { background: %(surface_alt)s; border: 1px solid %(border)s; border-radius: 16px; }
 QFrame#learning_context { background: %(surface_alt)s; border: 1px solid %(border)s; border-radius: 16px; }
-QWidget[ui="2"] QPushButton#submit_work { background: %(selection)s; color: %(selection_ink)s; border: 2px solid %(primary)s; }
-QWidget[ui="2"] QPushButton#submit_work:hover { background: %(text_selection)s; }
+QWidget[ui="2"] QPushButton#submit_work { background: %(primary)s; color: %(primary_ink)s; border: 2px solid %(primary)s; }
+QWidget[ui="2"] QPushButton#submit_work:hover { background: %(primary_hover)s; border-color: %(primary_hover)s; }
 QWidget[ui="2"] QPushButton#submit_work:disabled { background: %(primary_off)s; color: %(primary_off_ink)s; border-color: %(border)s; }
 QWidget[ui="2"] QFrame#row[subject="true"] { background: %(surface)s; border: 1px solid %(line)s; border-radius: 16px; }
 QWidget[ui="2"] QFrame#row[subject="true"][over="true"] { background: %(surface)s; border-color: %(border_strong)s; }
@@ -516,6 +522,7 @@ def _style(scheme):
                        (role.ToolTipText, "ink"), (role.Link, "link")):
         palette.setColor(part, qcolor(name))
     app.setPalette(palette)
+    QToolTip.setFont(font("caption"))
     tokens = style_tokens(scheme)
     app.setStyleSheet(STYLE % tokens + STYLE_V2 % tokens + EDITOR_STYLE)
 

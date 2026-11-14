@@ -2,10 +2,11 @@
 """파이썬의 다음 회차·숙달 단원·지난 회차를 모음. 제출은 창 아래 공통 영역에서 다룸."""
 import html
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QWidget
 
-from gui import errors, kit, theme
+from gui import feedback, kit, theme
 from gui.widgets import LinkLabel, UnitStrip
 
 
@@ -30,12 +31,14 @@ class HomePage(QWidget):
         self.hub_btn = top.back
         self.wrong_btn = top.add_right(kit.button("오답 노트", "text"))
         self.theme_btn = top.add_right(kit.button("", "text"))
+        self.theme_btn.setToolTip("화면 테마를 시스템·밝게·어둡게 순서로 바꿉니다.")
         outer.addWidget(top)
         inner = QWidget()
         root = kit.box(inner, (0, 24, 0, 32), 24)
         self.user = kit.label("", "caption", "tertiary")
         root.addWidget(self.user)
         self.data_btn = kit.button("학습 데이터")
+        self.data_btn.setToolTip("파이썬 학습 기록의 수집 설정·전송 상태·파일 내보내기 창을 엽니다.")
         self.data_btn.clicked.connect(self.show_data)
         root.addWidget(self.data_btn)
         self.notice = LinkLabel()
@@ -76,9 +79,10 @@ class HomePage(QWidget):
         self.busy_bar.hide()
         root.addWidget(self.status)
         root.addWidget(self.busy_bar)
-        self.foot = LinkLabel('<a href="%s">불편한 점 알리기</a>' % errors.ISSUE_URL)
+        self.foot = LinkLabel('<a href="%s">불편한 점 알리기</a>' % feedback.ISSUE_URL)
         kit.typed(self.foot, "caption")
-        self.foot.setOpenExternalLinks(True)
+        self.foot.setOpenExternalLinks(False)
+        self.foot.linkActivated.connect(lambda _: QDesktopServices.openUrl(QUrl(feedback.issue_url(win))))
         root.addWidget(self.foot)
         column = kit.column(inner)
         column.layout().setContentsMargins(32, 0, 32, 0)

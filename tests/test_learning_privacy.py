@@ -19,6 +19,48 @@ from submission_api import Client
 
 
 class PrivacyTest(unittest.TestCase):
+    def test_v2_consent_survives_server_wording_update_without_resetting_collection(self):
+        from learning_data import privacy
+        old_version = "2026-11-12-v2"
+        old_hash = privacy.SUPPORTED_POLICIES[old_version]
+        with mock.patch.multiple(privacy, POLICY_VERSION=old_version, POLICY_HASH=old_hash):
+            self.consent.choose(True)
+            self.consent.set_auto_submission(True)
+        before = self.consent.path.read_bytes()
+        starts = self.consent.settings()["start"].copy()
+        epochs = {name:store.status()["epoch"] for name,store in self.collections.items()}
+        for store in self.collections.values():
+            store.initialize_distribution()
+            self.assertTrue(store.status()["enabled"])
+            self.assertTrue(store.emit("answer", {"result": "pass", "card": "q1"}))
+        self.assertFalse(self.consent.needs_choice())
+        self.assertFalse(self.consent.needs_auto_choice())
+        result = self.consent.synchronize()
+        self.assertFalse(result["errors"])
+        self.assertGreater(result["sent"], 0)
+        self.assertEqual(before, self.consent.path.read_bytes())
+        self.assertEqual(starts, self.consent.settings()["start"])
+        self.assertEqual(epochs, {name:store.status()["epoch"] for name,store in self.collections.items()})
+        old = self.consent.settings()["receipt"]
+        self.assertEqual(old, privacy.validate_receipt(old, automatic=True))
+        self.assertEqual(privacy.POLICY_VERSION, privacy.receipt()["policy"])
+        invalid = dict(old, policy_hash=privacy.POLICY_HASH)
+        with self.assertRaises(ValueError):
+            privacy.validate_receipt(invalid)
+        with self.assertRaises(ValueError):
+            privacy.validate_receipt(dict(old, policy=[]))
+        self.consent.withdraw()
+        self.assertTrue(self.consent.synchronize()["withdrawn"])
+        self.assertFalse(self.consent.needs_choice())
+        self.assertEqual(old_version, self.consent.settings()["policy"])
+        self.assertEqual(old_hash, self.consent.settings()["policy_hash"])
+        self.assertFalse(self.consent.settings()["accepted"])
+
+    def test_unmocked_http_is_rejected_by_the_fixture(self):
+        import urllib.request
+        with self.assertRaisesRegex(AssertionError, "외부 서버"):
+            urllib.request.build_opener().open("https://example.invalid")
+
     def test_invalid_saved_consent_time_stays_a_recoverable_sync_error(self):
         self.consent.choose(True)
         from learning_data.privacy import save
@@ -52,7 +94,9 @@ class PrivacyTest(unittest.TestCase):
         self.db = Database(self.root / "server/learning.sqlite3")
         self.app = application(self.db, legacy_contract=True)
         for patcher in (mock.patch.dict(os.environ, {"STUDY_OPEN_REGISTRATION": "1"}),
-                        mock.patch.object(sharing, "request", self.transport)):
+                        mock.patch.object(sharing, "request", self.transport),
+                        mock.patch("learning_data.submission.request", self.transport),
+                        mock.patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("시험에서 외부 서버를 호출할 수 없습니다."))):
             patcher.start()
             self.addCleanup(patcher.stop)
 

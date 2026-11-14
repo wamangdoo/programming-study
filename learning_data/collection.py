@@ -10,8 +10,9 @@ import sqlite3
 import tempfile
 import uuid
 
-from learning_data import goals
+from learning_data import generation, goals
 
+AI_INPUT_SCHEMA = 1
 FORMAT = 1
 NOTICE = "2026-11-08-v2"
 FILENAME = "learning-data.sqlite3"
@@ -42,7 +43,8 @@ def digest(value):
 def runtime_revision(track="ai"):
     folder = os.path.dirname(os.path.dirname(__file__))
     values = {}
-    paths = ("learning_data/collection.py", "aiprep/service.py", "aiprep/mock.py", "aiprep/grade.py", "aiprep/gen.py", "aiprep/skel.py")
+    paths = ("learning_data/collection.py", "learning_data/generation.py", "aiprep/bank.py",
+             "aiprep/service.py", "aiprep/mock.py", "aiprep/grade.py", "aiprep/gen.py", "aiprep/skel.py")
     if track == "python":
         paths = ("session.py", "learning_data/python.py", "adaptive.py", "study.py", "learning_data/collection.py")
     for name in paths:
@@ -64,6 +66,8 @@ def question(item, **metadata):
     visible = {key: item[key] for key in ("stem", "kind", "pick", "multi") if key in item}
     visible["blanks"] = [{key: b[key] for key in ("mode", "hint", "slot") if key in b} for b in item.get("blanks") or []]
     visible["options"] = [{"no": n, "text": item["options"][n]["text"]} for n in order]
+    if item.get("_generation") is not None:
+        visible["generation"] = generation.capture(item["_generation"], item, visible)
     metadata["runtime_revision"] = runtime_revision(metadata.pop("track", "ai"))
     visible.update(metadata)
     revision = digest({"item": item, "metadata": metadata, "order": order})
@@ -148,11 +152,12 @@ class Collection:
 
     def initialize_distribution(self):
         """첫 실행의 명시적 선택 전에는 수집하지 않음. 이전 버전의 기록을 보존하고 수집만 멈춤."""
-        from learning_data.privacy import POLICY_VERSION
+        from learning_data.privacy import SUPPORTED_POLICIES
         if not os.path.exists(self.path):
             return
         with self._connect() as conn:
-            if conn.execute("SELECT value FROM meta WHERE key='consent_policy'").fetchone() != (POLICY_VERSION,):
+            policy = conn.execute("SELECT value FROM meta WHERE key='consent_policy'").fetchone()
+            if policy is None or policy[0] not in SUPPORTED_POLICIES:
                 conn.execute("INSERT OR REPLACE INTO meta VALUES ('enabled', '0')")
 
     def latest_sequence(self):
@@ -185,9 +190,9 @@ class Collection:
             try:
                 with open(meta["privacy_state_path"], encoding="utf-8") as source:
                     state = json.load(source)
-                from learning_data.privacy import POLICY_VERSION, POLICY_HASH
-                return (state.get("accepted") is True and state.get("policy") == POLICY_VERSION
-                        and state.get("policy_hash") == POLICY_HASH and not state.get("withdraw_pending"))
+                from learning_data.privacy import known_policy
+                return (state.get("accepted") is True and known_policy(state)
+                        and not state.get("withdraw_pending"))
             except (OSError, ValueError, AttributeError):
                 return False
         return True
@@ -267,17 +272,23 @@ class Collection:
                 if observation_context is CURRENT_CONTEXT:
                     payload["goal"] = json.loads(meta["goal"]) if "goal" in meta else goals.unselected()
                 else:
-                    if kind not in ("mock_answer", "mock_submit") and not (self.track == "python" and kind in ("answer", "python_input", "question_returned")):
+                    allowed = {"mock_answer", "mock_submit"}
+                    allowed.update({"answer", "python_input", "question_returned"} if self.track == "python" else {"ai_input"})
+                    if kind not in allowed:
                         raise ValueError("관찰 문맥을 지정할 수 없는 기록입니다.")
                     context = observation_context or {}
                     payload["goal"] = context.get("goal")
                     payload["observed_at"] = context.get("observed_at")
                     if context.get("epoch") != meta.get("epoch"):
-                        if kind in ("mock_submit", "python_input", "question_returned"):
+                        if kind in ("mock_submit", "python_input", "ai_input", "question_returned"):
                             return False
                         payload.update(response=None, goal=None, observed_at=None)
                         if payload.get("result") != "blank":
                             payload["result"] = "not_collected"
+                if kind in ("answer", "mock_answer") and payload.get("result") != "not_collected" and "response" in payload:
+                    response = payload["response"]
+                    values = response if isinstance(response, (list, tuple)) else [response]
+                    payload["answered"] = any(v is not None and str(v).strip() for v in values)
                 if at is not None:
                     payload["source_at"] = at
                 eid = str(uuid.uuid5(uuid.UUID(meta["participant"]), key)) if key else str(uuid.uuid4())

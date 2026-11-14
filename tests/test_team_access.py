@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """기기 확인·권한 분리와 집계의 원본 보존을 확인함."""
+import contextlib
 import datetime
 import io
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -136,6 +138,67 @@ class AccessTest(unittest.TestCase):
             with self.assertRaises(ApiError):
                 self.access.summary(token, days, now)
 
+    def test_graded_series_place_midnight_and_unknown_dates_in_separate_counts(self):
+        rows = [
+            ("ai", "answer", "pass", "2026-11-12T15:00:00+00:00"),
+            ("python", "answer", "wrong", "2026-11-12T14:59:59+00:00"),
+            ("ai", "legacy_answer", "partial", "2026-11-13T12:00:00+09:00"),
+            ("ai", "mock_answer", "stuck", "2026-11-13T09:00:00+09:00"),
+        ]
+        with self.database.connect() as db:
+            for n, (track, kind, result, at) in enumerate(rows, 1):
+                payload = json.dumps({"kind": kind, "data": {"card": "q", "result": result}, "at": at})
+                db.execute("INSERT INTO events VALUES (?,?,?,?,?)", ("participant", track, str(n), n, payload))
+        viewer = "Bearer " + self.access.verify(self.data)["token"]
+        now = datetime.datetime(2026, 11, 13, 12, tzinfo=KST)
+        for days in (1, 7, 15, 30):
+            graded = self.access.summary(viewer, days, now)["graded"]
+            self.assertEqual((3, 1, 1), (graded["total"], graded["undated"], graded["unknown"]))
+            self.assertEqual(1 if days == 1 else 2, graded["period_total"])
+            self.assertEqual(1, graded["series"][0 if days == 1 else -1]["ai"])
+            if days != 1:
+                self.assertEqual(1, graded["series"][-2]["python"])
+
+    def test_period_activity_preserves_raw_and_counts_cards_across_days_and_people(self):
+        now = datetime.datetime(2026, 11, 13, 12, tzinfo=KST)
+        viewer = "Bearer " + self.access.verify(self.data)["token"]
+        revision = "a" * 64
+        def add(seq, kind, day=13, track="ai", participant="a", card="q", item=None, **fields):
+            at = now.replace(day=day, hour=9).isoformat()
+            data = dict(card=card, set="s", **fields)
+            event = dict(at=at, kind=kind, data=data, item=item, item_revision=revision if item else None)
+            db.execute("INSERT INTO events VALUES (?,?,?,?,?)", (participant, track, str(seq), seq, json.dumps(event)))
+        with self.database.connect() as db:
+            add(1, "question_returned", day=11)
+            add(2, "question_returned", day=13, participant="b")
+            add(3, "mock_question_returned", input_schema=1)
+            add(4, "ai_input", input_schema=1)
+            add(5, "set", card="not-shown")
+            add(6, "answer", result="pass", item={"stem": "문제", "tags": ["개념"]})
+            add(7, "question_returned", track="python")
+            add(8, "python_input", track="python", item={"level": 2})
+            add(9, "answer", track="python", item={"level": 2}, input_event="8", result="wrong")
+            add(10, "mock_answer", card="never-opened", result="stuck", answered=False)
+            add(11, "answer", card="used", item={"difficulty": True}, result="pass")
+            add(12, "ai_input", day=10, input_schema=True)
+            add(13, "question_returned", day=8, input_schema=1)
+            add(14, "answer", track="python", participant="b", item={"level": 2}, result="ok", input_event="8")
+            before = db.execute("SELECT * FROM events ORDER BY rowid").fetchall()
+        result = self.access.summary(viewer, 7, now)
+        activity = result["activity"]
+        self.assertEqual((14, 14, 4, 2), (result["total"], result["period_total"], result["graded"]["period_total"],
+                                          activity["distinct_cards"]))
+        self.assertEqual(5, sum(row["ai"] + row["python"] for row in activity["opens"]))
+        self.assertEqual([None, 0, None, None, None, None, 1], [row["ai"] for row in activity["inputs"]])
+        self.assertTrue(activity["inputs"][-1]["ai_unmeasured"])
+        self.assertEqual(1, activity["inputs"][-1]["python"])
+        self.assertEqual(now.replace(day=8, hour=9).isoformat(), activity["period_first_ai_measurement_at"])
+        self.assertEqual(dict(stem=1, concepts=1, revision=4, difficulty=2, ordered_timed=4, linked_input=1),
+                         activity["graded_metadata"])
+        self.assertNotIn("never-opened", json.dumps(activity))
+        with self.database.connect() as db:
+            self.assertEqual(before, db.execute("SELECT * FROM events ORDER BY rowid").fetchall())
+
     def test_migration_and_deletion_preserve_source_records_and_reconcile_counts(self):
         self.insert("1", "2026-11-13T09:00:00+09:00")
         with self.database.connect() as db:
@@ -148,3 +211,41 @@ class AccessTest(unittest.TestCase):
             self.assertEqual(1, db.execute("SELECT count(*) FROM team_events").fetchone()[0])
             db.execute("DELETE FROM events")
             self.assertEqual(0, db.execute("SELECT count(*) FROM team_events").fetchone()[0])
+
+    def test_existing_database_backfill_is_atomic_and_preserves_original_rows(self):
+        self.insert("1", "2026-11-13T01:00:00+00:00")
+        with self.database.connect() as db:
+            payload = json.dumps({"at": "2026-11-13T01:00:00+00:00", "kind": "answer",
+                                  "data": {"card": "q1", "result": "wrong"}})
+            db.execute("UPDATE events SET payload=?", (payload,))
+            self.assertEqual([(1,)], db.execute("SELECT confirmed FROM team_attempts").fetchall())
+            for action in ("insert", "update", "delete"):
+                db.execute("DROP TRIGGER team_attempts_" + action)
+            db.execute("DROP VIEW team_attempt_source")
+            db.execute("DROP TABLE team_attempts")
+        def original_rows():
+            uri = Path(self.database.path).resolve().as_uri() + "?mode=ro"
+            with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+                return {table: db.execute("SELECT * FROM " + table).fetchall()
+                        for table in ("events", "team_events", "storage_totals", "identity_grants")}
+        before = original_rows()
+        connect = sqlite3.connect
+        def interrupt(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_authorizer(lambda action, name, *_: sqlite3.SQLITE_DENY
+                              if action == sqlite3.SQLITE_CREATE_TRIGGER and name == "team_attempts_update" else sqlite3.SQLITE_OK)
+            return db
+        with mock.patch("sqlite3.connect", side_effect=interrupt), self.assertRaises(sqlite3.DatabaseError):
+            Database(self.database.path)
+        with self.database.connect() as db:
+            self.assertEqual([], db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'team_attempt%'").fetchall())
+        self.assertEqual(before, original_rows())
+        for _ in range(2):
+            Database(self.database.path)
+            self.assertEqual(before, original_rows())
+            with self.database.connect() as db:
+                self.assertEqual([(1,)], db.execute("SELECT confirmed FROM team_attempts").fetchall())
+        with self.database.connect() as db:
+            db.execute("UPDATE events SET payload='{}'")
+            self.assertEqual([], db.execute("SELECT * FROM team_attempts").fetchall())
+            self.assertEqual(1, db.execute("SELECT count(*) FROM team_events").fetchone()[0])

@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """모의고사 답안을 로컬에 저장하고 제출한 뒤에만 판정과 해설을 보임."""
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QLineEdit, QWidget
+from PyQt6.QtWidgets import QWidget
 
-from aiprep import bank
+from aiprep import bank, mixed_mock
 from aiprep.grade import BLANK
 from aiprep.mock import MockError
 from gui import ai_text, kit, theme
 from gui.ai_learn import ChoiceList, CodeChoices, CodeSlots, RichPara, doc, reading_column
 from gui.docview import Doc
 from gui.ai_quiz import commit_input, split_stem
-from gui.widgets import PasteBlock
+from gui.widgets import AnswerLine, PasteBlock
 from session import SessionError
 
 
@@ -31,6 +31,7 @@ class MockPage(QWidget):
         self.clock_box, self.clock_caption, self.time = kit.clock()
         self.top.add_right(self.clock_box)
         self.top_submit = self.top.add_right(kit.button('제출', 'text', 's'))
+        self.top_submit.setToolTip('모의고사를 끝내고 답안을 채점해 정답과 해설을 표시합니다. 풀이 파일의 자동 제출은 별도 동의에 따릅니다.')
         self.top_submit.clicked.connect(self.confirm_submit)
         self.top.back.clicked.connect(self.go_back)
         root.addWidget(self.top)
@@ -57,7 +58,9 @@ class MockPage(QWidget):
         self.previous_btn = self.bar.add_action(kit.button('이전', 'secondary', 'l'))
         self.next_btn = self.bar.add_action(kit.button('다음', 'primary', 'l'))
         self.submit_btn = self.bar.add_action(kit.button('제출', 'primary', 'l'))
+        self.submit_btn.setToolTip(self.top_submit.toolTip())
         self.retry_btn = self.bar.add_action(kit.button('다시 풀기', 'secondary', 'l'))
+        self.retry_btn.setToolTip('같은 모의고사의 새 응시를 시작합니다. 이전 응시 기록은 보관합니다.')
         self.home_btn = self.bar.add_action(kit.button('홈으로', 'secondary', 'l'))
         self.notes_btn = self.bar.add_action(kit.button('오답 노트로', 'primary', 'l'))
         self.start_btn = self.bar.add_action(kit.button('시작', 'primary', 'l'))
@@ -86,6 +89,7 @@ class MockPage(QWidget):
             raise MockError('쓰던 답안을 먼저 저장하세요.')
         self.mid = mid
         info = self.win.ai.mock_info(mid)
+        self.top.back.setText('← ' + bank.COURSES[self.win.ai.course])
         self.restart_required = info["restart_required"]
         self.top.title.setText(info['title'])
         self.top.title.show()
@@ -97,8 +101,12 @@ class MockPage(QWidget):
         self.numbers.hide()
         self.lesson_results.hide()
         self.clock_box.hide()
-        self.heading.setText('%d문항 · %d분 · %d~%d차시 · 빈칸 %d · 고르기 %d' %
-                             (info['count'], info['minutes'], *info['range'], info['blanks'], info['choices']))
+        if mixed_mock.candidate(info):
+            self.heading.setText(mixed_mock.description(info) + '\n빈칸 %d · 고르기 %d' % (info['blanks'], info['choices']))
+            doc('120분은 약 2시간 연습을 위한 기본값입니다. 공식 평가 시간을 뜻하지 않습니다.', '', self.card_box)
+        else:
+            self.heading.setText('%d문항 · %d분 · %d~%d차시 · 빈칸 %d · 고르기 %d' %
+                                 (info['count'], info['minutes'], *info['range'], info['blanks'], info['choices']))
         doc('시작하면 시계가 멈추지 않습니다. 프로그램을 꺼도 시간이 흐르고, 시간이 다 되면 그때까지 쓴 답으로 제출됩니다. 부분 점수는 없습니다.', '', self.card_box)
         if self.restart_required:
             doc("시작 당시 문항 버전과 현재 자료가 일치하지 않습니다. [새 자료로 시작]을 누르면 새 응시를 시작합니다. 이전 초안과 응시 기록은 보관합니다.", "", self.card_box)
@@ -109,6 +117,9 @@ class MockPage(QWidget):
         if self.restart_required:
             start_label = "새 자료로 시작"
         self.start_btn.setText(start_label)
+        self.start_btn.setToolTip('새 자료로 새 응시를 시작하고 이전 초안과 응시 기록은 보관합니다.' if self.restart_required else
+                                  '채점한 모의고사의 결과와 정답·해설을 엽니다.' if info['taken'] else
+                                  '모의고사를 시작합니다. 프로그램을 꺼도 제한 시간은 계속 흐릅니다.')
         for button in (self.flag_btn, self.previous_btn, self.next_btn, self.submit_btn, self.home_btn, self.notes_btn, self.top_submit):
             button.hide()
         self.retry_btn.setVisible(info['taken'])
@@ -199,6 +210,8 @@ class MockPage(QWidget):
         self.showing_result = done
         self.dirty = False
         self.card_box.addWidget(kit.label('%d / %d' % (item['at'], item['total']), 'headline'))
+        if item.get('course'):
+            self.card_box.addWidget(kit.para(ai_text.lesson_title(item['course_no'], '', item['course']), 'caption', 'secondary'))
         if item['kind'] == 'blank':
             blanks, count = item['blanks'], 0
             stem = bank.number_blanks(item['stem']) if len(blanks) > 1 else item['stem']
@@ -213,7 +226,7 @@ class MockPage(QWidget):
                 else:
                     doc(text, '', self.card_box)
                     for _ in BLANK.findall(text):
-                        field = QLineEdit()
+                        field = AnswerLine()
                         kit.typed(field, 'body')
                         field.setPlaceholderText(blanks[count].get('hint') or ai_text.MODE_HINT.get(blanks[count]['mode'], ''))
                         if len(blanks) > 1:
@@ -271,6 +284,8 @@ class MockPage(QWidget):
         last = self.item['at'] == self.item['total']
         self.next_btn.setEnabled(not last and not self.busy)
         self.flag_btn.setText('표시 해제' if self.item.get('flagged') else '나중에 보기')
+        self.flag_btn.setToolTip('현재 문항의 나중에 볼 표시를 지웁니다. 다른 문항으로 이동하지 않습니다.' if self.item.get('flagged') else
+                                 '현재 문항에 나중에 볼 표시를 남깁니다. 다른 문항으로 이동하지 않습니다.')
         self.flag_btn.setVisible(not done)
         self.previous_btn.show()
         self.lesson_results.setVisible(done)
@@ -289,8 +304,9 @@ class MockPage(QWidget):
             if self.summary_key != summary_key:
                 self.lesson_results.clear()
                 for lid, counts in rows:
-                    entry = self.win.ai.lessons.get(lid, {})
-                    title = ai_text.lesson_title(entry.get('no', lid), entry.get('title', ''))
+                    entries = self.exam.sess.mock_lessons if self.exam.mixed else self.win.ai.lessons
+                    entry = entries.get(lid, {})
+                    title = ai_text.lesson_title(entry.get('no', lid), entry.get('title', ''), entry.get('course', 'intro'))
                     self.lesson_results.add(kit.Row(title.strip(), end='%d / %d' % (counts['correct'], counts['total']), inert=True))
                 self.summary_key = summary_key
             self.heading.setText('%d / %d문항 맞음 · 걸린 시간 %d분 %d초\n처음 점수 %d / %d\n틀리거나 비운 문항은 첫 풀이 결과를 기준으로 다음 날부터 복습합니다.' %
@@ -344,6 +360,7 @@ class MockPage(QWidget):
             return
         try:
             self.exam.submit(auto=auto)
+            self.win.auto_submission.request()
             self.show_question(self.item['at'] - 1)
         except MockError as error:
             self.fail(error)
@@ -359,6 +376,7 @@ class MockPage(QWidget):
             return
         if self.exam.result is not None:
             if not self.showing_result and self.item is not None:
+                self.win.auto_submission.request()
                 self.show_question(self.item['at'] - 1)
                 return
             self.time.setText('제출 완료')

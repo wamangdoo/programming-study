@@ -33,6 +33,34 @@ def github(path, data):
         raise CollectionError("GitHub에 연결하지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.") from None
 
 
+def validate_activity(activity, series, graded):
+    def count(value):
+        return type(value) is int and value >= 0
+
+    if not count(activity["distinct_cards"]) or type(activity["ai_input_schema"]) is not int or activity["ai_input_schema"] != 1:
+        raise ValueError()
+    for name in ("opens", "inputs"):
+        rows = activity[name]
+        if not isinstance(rows, list) or len(rows) != len(series):
+            raise ValueError()
+        for row, bucket in zip(rows, series):
+            if row["at"] != bucket["at"] or not count(row["python"]):
+                raise ValueError()
+            if name == "inputs" and type(row["ai_unmeasured"]) is not bool:
+                raise ValueError()
+            if not count(row["ai"]) and not (name == "inputs" and row["ai"] is None):
+                raise ValueError()
+    first = activity["period_first_ai_measurement_at"]
+    if (first is not None) != any(row["ai"] is not None for row in activity["inputs"]):
+        raise ValueError()
+    if first is not None and datetime.datetime.fromisoformat(first).tzinfo is None:
+        raise ValueError()
+    for key in ("stem", "concepts", "revision", "difficulty", "ordered_timed", "linked_input"):
+        value = activity["graded_metadata"][key]
+        if not count(value) or value > graded["period_total"]:
+            raise ValueError()
+
+
 class Identity:
     def __init__(self, repository, user, home=None, base=DEFAULT_SERVER):
         import session
@@ -162,16 +190,31 @@ class Identity:
             raise CollectionError("스터디원에게만 제공하는 통계입니다.")
         result = request(self.base, "/v1/team/summary?days=" + str(days), token=settings["token"], method="GET", error_detail=True)
         try:
-            for key in ("total", "period_total", "undated", "installations", "period_installations", "accounts", "period_accounts"):
+            if result["days"] != days:
+                raise ValueError()
+            for key in ("installations", "period_installations", "accounts", "period_accounts"):
                 if type(result[key]) is not int or result[key] < 0:
                     raise ValueError()
-            if result["days"] != days or len(result["series"]) != (24 if days == 1 else days):
+            summaries = [result]
+            if "graded" in result:
+                graded = result["graded"]
+                if not isinstance(graded, dict) or type(graded["unknown"]) is not int or graded["unknown"] < 0:
+                    raise ValueError()
+                summaries.append(graded)
+            for summary in summaries:
+                if any(type(summary[k]) is not int or summary[k] < 0 for k in ("total", "period_total", "undated")):
+                    raise ValueError()
+                if len(summary["series"]) != (24 if days == 1 else days):
+                    raise ValueError()
+                for row in summary["series"]:
+                    if (not isinstance(row["at"], str) or datetime.datetime.fromisoformat(row["at"]).tzinfo is None
+                            or any(type(row[k]) is not int or row[k] < 0 for k in ("python", "ai"))):
+                        raise ValueError()
+            if "graded" in result and (sum(row["ai"] + row["python"] for row in graded["series"]) != graded["period_total"]
+                                       or graded["period_total"] + graded["undated"] > graded["total"]):
                 raise ValueError()
-            for row in result["series"]:
-                if not isinstance(row["at"], str) or any(type(row[key]) is not int or row[key] < 0 for key in ("python", "ai")):
-                    raise ValueError()
-                if datetime.datetime.fromisoformat(row["at"]).tzinfo is None:
-                    raise ValueError()
+            if "activity" in result:
+                validate_activity(result["activity"], result["series"], result["graded"])
         except (KeyError, TypeError, ValueError):
             raise CollectionError("통계 응답을 읽지 못했습니다. 프로그램을 업데이트한 뒤 다시 확인해 주세요.") from None
         return result

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QFileDialog, QLabel, QLineEdit, QMain
 import session
 import study
 from learning_data.collection import CollectionError
-from aiprep import service as ai_service
+from aiprep import bank as ai_bank, service as ai_service
 from gui import errors, journey_text, kit, motion, theme, web_text
 from gui.ai_home import AiHomePage, AiLessonPage
 from gui.ai_learn import AiLearnPage, AiNotePage, RevisitPage
@@ -84,8 +84,7 @@ class StartPage(QWidget):
         self.setObjectName("page")
         box = QVBoxLayout(self)
         box.setSpacing(14)
-        title = QLabel("프로그래밍 스터디")
-        title.setObjectName("h1")
+        title = kit.label("프로그래밍 스터디", "title", bold=True)
         self.status = QLabel("")
         self.status.setObjectName("muted")
         self.busy_bar = QProgressBar()
@@ -94,10 +93,13 @@ class StartPage(QWidget):
         self.busy_bar.setFixedWidth(260)
         self.busy_bar.hide()
         self.error = Para(name="error")
+        kit.typed(self.error, "body")
         self.error.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.retry = QPushButton("다시 시도")
+        kit.typed(self.retry, "label")
         self.retry.hide()
-        self.retry.clicked.connect(lambda: win.open_session())
+        self.retry_boot = False
+        self.retry.clicked.connect(lambda: win.boot() if self.retry_boot else win.open_session())
         box.addStretch(2)
         for widget in (title, self.status, self.busy_bar):
             box.addWidget(widget, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -123,9 +125,11 @@ class MainWindow(QMainWindow):
         self.journey, self.journey_error = None, ""  # 알고리즘 여행 서비스와 그것을 열지 못한 이유
         self.web, self.web_error = None, ""  # 웹 면접 준비 서비스와 열지 못한 이유
         self.ai, self.ai_error = None, ""  # AI 비전 개론 서비스와 열지 못한 이유
+        self.ai_courses = {}
         self.web_node_known, self.web_node_seen = False, False  # 웹 트랙의 Node 를 찾아 봤는지, 그때 node 모듈이 결과를 기억했는지
         self.area = "hub"  # 지금 있는 쪽: hub, python(홈 이하), journey(지도·문제 화면), web(웹 홈·미션·드릴·학습 노트), ai(AI 비전 개론)
         self.job = None  # 도는 중인 워커 (Job, 잠근 화면, 끝났을 때, 실패했을 때)
+        self.submission_running = False
         self.pending_submission = {"status": "checking", "pending": False, "count": 0}
         self.problem_updates = {"status": "checking", "available": False, "count": 0}
         self.next_update_check = 0
@@ -160,11 +164,15 @@ class MainWindow(QMainWindow):
                      self.ai_home, self.ai_lesson, self.ai_learn, self.ai_note, self.ai_revisit, self.ai_quiz, self.ai_mock):
             self.pages.addWidget(page)
         self.workspace = Workspace(self, self.pages)
+        from gui.career_controller import CareerController
+        self.career = CareerController(self)
         self.result_page.git_btn.hide()
         self.hub.git_btn = self.home.git_btn = self.workspace.submissions.submit
         self.result_page.git_btn = self.workspace.submissions.submit
         self.hub.sync_btn = self.home.sync_btn = self.workspace.submissions.sync
         self.setCentralWidget(self.workspace)
+        from gui.auto_submission import AutoSubmission
+        self.auto_submission = AutoSubmission(self)
         self.pages.currentChanged.connect(self.check_pending_submission)
         self.pending_timer = QTimer(self)
         self.pending_timer.setInterval(15000)
@@ -195,9 +203,18 @@ class MainWindow(QMainWindow):
 
     def boot(self):
         self.first_boot = True
-        user = session.saved_user()
-        if not user:
-            user = session.save_user("learner-" + uuid.uuid4().hex[:10])
+        try:
+            user = session.saved_user()
+            if not user:
+                user = session.save_user("learner-" + uuid.uuid4().hex[:10])
+        except SessionError as error:
+            self.start.retry_boot = True
+            self.start.set_busy(False)
+            self.start.show_error(str(error))
+            motion.switch(self.pages, self.start)
+            return
+        self.start.retry_boot = False
+        self.start.show_error("")
         self.sync_first(user)
 
     def sync_first(self, user):
@@ -285,6 +302,7 @@ class MainWindow(QMainWindow):
     def open_session(self, then=None):
         """풀이 기록과 문제 은행을 새로 읽고 then()(없으면 허브)으로 감. 풀이 기록을 읽지 못하면 시작 화면에 이유를 보여 주고 False 를 돌려줌.
         알고리즘 여행 기록을 읽지 못하면 파이썬 스터디는 그대로 열고, 허브의 여행 카드에 이유를 보여 줌. 여기서는 node 를 찾지 않음."""
+        self.workspace.submissions.clear_result()
         if not self.ensure_identity(then):
             return False
         try:
@@ -308,9 +326,12 @@ class MainWindow(QMainWindow):
             self.web, self.web_error = None, str(error)
         self.ai_quiz.clear()  # 옛 서비스의 묶음과 카드를 놓음
         self.ai_mock.clear()
+        self.ai_courses.clear()
         try:
             course = self.settings.value("ai/course/" + self.user, "intro", type=str)
+            stamp = ai_bank.source_stamp()
             self.ai = ai_service.AiSession(self.user, course=course if course in ("intro", "app") else "intro")
+            self.ai_courses[self.ai.course] = (stamp, self.ai)
             self.ai_error = ""
         except SessionError as error:
             self.ai, self.ai_error = None, str(error)
@@ -325,6 +346,8 @@ class MainWindow(QMainWindow):
         self.privacy_controllers = getattr(self, "privacy_controllers", {})
         if new_privacy_path not in self.privacy_controllers:
             self.privacy_controllers[new_privacy_path] = SyncController(self, collections)
+            self.privacy_controllers[new_privacy_path].changed.connect(self.workspace.refresh)
+            self.privacy_controllers[new_privacy_path].changed.connect(self.auto_submission.changed)
             self.first_boot = True
             self.tour_ready = False
         self.privacy = self.privacy_controllers[new_privacy_path]
@@ -339,15 +362,24 @@ class MainWindow(QMainWindow):
             try:
                 if self.privacy.consent.needs_choice():
                     QTimer.singleShot(0, self.show_first_consent)
+                elif self.privacy.consent.needs_auto_choice() and os.environ.get("STUDY_AUTO_SYNC", "1") != "0":
+                    QTimer.singleShot(0, self.show_auto_submission_notice)
                 else:
                     self.enable_hub_tour()
             except CollectionError as error:
                 self.ask("동의 설정 확인", str(error))
+        self.auto_submission.changed()
+        self.auto_submission.request()
         return True
 
     def show_first_consent(self):
         self.privacy.show(first=True)
-        self.privacy.dialog.accepted.connect(self.enable_hub_tour)
+        def continue_setup():
+            if self.privacy.consent.needs_auto_choice() and os.environ.get("STUDY_AUTO_SYNC", "1") != "0":
+                self.show_auto_submission_notice()
+            else:
+                self.enable_hub_tour()
+        self.privacy.dialog.accepted.connect(continue_setup)
 
     def enable_hub_tour(self):
         self.tour_ready = True
@@ -366,6 +398,13 @@ class MainWindow(QMainWindow):
         if self.hub_tour is None:
             self.hub_tour = HubTour(self)
         self.hub_tour.begin(self.hub.replay_tour if replay else QApplication.focusWidget())
+
+    def show_auto_submission_notice(self):
+        from gui.privacy import AutoSubmissionDialog
+        if self.privacy.consent.needs_auto_choice():
+            self.automatic_dialog = AutoSubmissionDialog(self, self.privacy)
+            self.automatic_dialog.finished.connect(self.enable_hub_tour)
+            self.automatic_dialog.show()
 
     def show_privacy(self):
         if hasattr(self, "privacy"):
@@ -456,22 +495,39 @@ class MainWindow(QMainWindow):
         self.area = "ai"
         motion.switch(self.pages, self.ai_home)
 
+    def go_career(self):
+        self.career.show_roadmap()
+
+    def go_magazine(self):
+        self.career.show_magazine()
+
     def switch_ai_course(self, course):
         """과정별 읽던 위치와 연습을 보존한 채 같은 AI 홈을 바꿈."""
         if self.ai is None or self.ai.course == course or self.ai_home.busy:
             return
         try:
-            selected = ai_service.AiSession(self.user, root=self.ai.root, course=course)
+            stamp = ai_bank.source_stamp(self.ai.root)
+            saved, selected = self.ai_courses.get(course, (None, None))
+            if stamp is None or saved != stamp or selected is None or selected.user != self.user or selected.root != self.ai.root:
+                selected = ai_service.AiSession(self.user, root=self.ai.root, course=course)
+            else:
+                selected.resume_course()
         except SessionError as error:
             self.ai_home.course_tabs.set_current(1 if self.ai.course == "app" else 0)
             self.ask("알림", str(error))
             return
-        self.ai_quiz.clear()
-        self.ai_mock.clear()
-        self.ai = selected
-        self.settings.setValue("ai/course/" + self.user, course)
-        self.ai_home.refresh()
-        self.ai_home.scroll.verticalScrollBar().setValue(0)
+        updates = self.ai_home.updatesEnabled()
+        self.ai_home.setUpdatesEnabled(False)
+        try:
+            self.ai_quiz.clear()
+            self.ai_mock.clear()
+            self.ai = selected
+            self.ai_courses[course] = (stamp, selected)
+            self.settings.setValue("ai/course/" + self.user, course)
+            self.ai_home.refresh()
+            self.ai_home.scroll.verticalScrollBar().setValue(0)
+        finally:
+            self.ai_home.setUpdatesEnabled(updates)
 
     def _open_ai(self, page, load):
         """AI 비전 개론 화면 page 를 load() 로 채우고 엶. 서비스가 AiError 를 내면 알리고 지금 화면에 머묾."""
@@ -644,6 +700,8 @@ class MainWindow(QMainWindow):
             self._session_error(error, rid, lambda: self.show_result(rid, result))
             return
         motion.switch(self.pages, self.result_page)
+        if result is not None:
+            self.auto_submission.request()
 
     def show_wrong(self, tid=None, back="python"):
         """오답 노트를 tid 트랙(없으면 지난번 트랙)으로 엶. back 은 위 막대의 돌아가기가 갈 곳(python 은 파이썬 스터디 홈, hub 는 첫 화면,
@@ -695,6 +753,7 @@ class MainWindow(QMainWindow):
         다른 일이 도는 중이면 시작하지 않고 False 를 돌려줌."""
         if self.job is not None:
             return False
+        self.workspace.submissions.clear_result()
         page = self.pages.currentWidget()
         page.set_busy(True, text)
         job = Job(fn, progress=on_progress is not None)
@@ -815,21 +874,56 @@ class MainWindow(QMainWindow):
         job.start()
 
     def submit_pr(self):
+        if self.gitflow is None or self.job is not None or self.submission_running or self.auto_submission.job is not None:
+            return
         api = getattr(self.gitflow, "api", None)
-        if api is not None:
-            self.show_submission_setup()
+        if api is not None and not self.has_submission_consent():
+            self.show_privacy()
             return
         if self.round_page.flush() and self.journey_page.flush():  # 쓰다 만 답과 코드가 빠진 채 올라가지 않게
-            self.run_job("제출하는 중입니다.", self.gitflow.submit, self._submitted)
+            self.submission_running = api is not None
+            started = self.run_job("풀이 결과를 서버로 제출합니다." if api is not None else "제출하는 중입니다.",
+                                   self.gitflow.submit, self._submitted,
+                                   on_fail=lambda: setattr(self, "submission_running", False))
+            if not started:
+                self.submission_running = False
+
+    def has_submission_consent(self):
+        if getattr(self.gitflow, "api", None) is None:
+            return True
+        controller = getattr(self, "privacy", None)
+        if controller is None:
+            return False
+        try:
+            state = controller.consent.settings()
+            return bool(state.get("accepted") and not state.get("withdraw_pending") and not controller.consent.needs_choice())
+        except CollectionError:
+            return False
 
     def _submitted(self, result):
+        self.submission_running = False
+        if getattr(self.gitflow, "api", None) is not None:
+            if result.get("status") in ("ok", "nothing"):
+                self.auto_submission.clear_blocked()
+                self.pending_submission = {"status": "checking", "pending": False, "count": 0}
+            self.workspace.submissions.show_result(result)
+            return
         if result.get("status") == "setup_required":
             self.show_submission_setup()
         else:
             self._git_done("제출", result)
 
+    def can_configure_submission(self):
+        if self.identity is None or not self.identity_checked or self.identity_invalid:
+            return False
+        try:
+            state = self.identity.settings()
+            return state.get("verified") is True and state.get("team") is True
+        except CollectionError:
+            return False
+
     def show_submission_setup(self):
-        if getattr(self.gitflow, "api", None) is None:
+        if not self.can_configure_submission() or getattr(self.gitflow, "api", None) is None:
             return
         from gui.submission_setup import SubmissionSetup
         if not self.round_page.flush() or not self.journey_page.flush():
@@ -837,9 +931,40 @@ class MainWindow(QMainWindow):
         self.submission_dialog = SubmissionSetup(self)
         self.submission_dialog.show()
 
+    def show_submission_files(self, parent=None):
+        api = getattr(self.gitflow, "api", None)
+        if api is None:
+            return
+        if not self.round_page.flush() or not self.journey_page.flush():
+            return
+        from gui.submission_setup import SubmissionFiles
+        self.submission_files_dialog = SubmissionFiles(parent or self, api)
+        self.submission_files_dialog.show()
+
     def fetch_problems(self):
         if self.round_page.flush() and self.journey_page.flush():
             self.run_job("업데이트 확인 중입니다.", self.gitflow.sync, self._fetched)
+
+    def check_updates(self):
+        """설정에서 파일을 바꾸지 않고 업데이트 유무만 확인함."""
+        flow = self.gitflow
+        if flow is None or not hasattr(flow, "updates") or self.job is not None or self.submission_running:
+            return
+
+        def done(result):
+            if self.gitflow is not flow:
+                return
+            if result.get("status") == "ok":
+                self.problem_updates = result
+                self.next_update_check = time.monotonic() + 300
+                self.workspace.refresh()
+                message = ("새 업데이트가 있습니다. [프로그램 업데이트]를 눌러 적용하세요."
+                           if result.get("available") else "최신 버전을 사용하고 있습니다.")
+            else:
+                message = "업데이트를 확인하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도하세요."
+            self.ask("업데이트 확인", message)
+
+        self.run_job("업데이트 확인 중입니다.", flow.updates, done)
 
     def _fetched(self, result):
         if self.web_node_first(lambda: self._fetched(result)):
@@ -850,7 +975,7 @@ class MainWindow(QMainWindow):
         self.notice = None  # 시작할 때 받지 못했다는 알림은 방금 결과가 대신함
         self.home.refresh()
         self.hub.refresh()
-        self._git_done("문제 받기", result)
+        self._git_done("프로그램 업데이트", result)
 
     def _git_done(self, title, result):
         if result.get("status") in ("ok", "nothing"):
@@ -921,6 +1046,12 @@ class MainWindow(QMainWindow):
         """시스템 → 밝게 → 어둡게 순서로 다음 테마를 고르고 기억함."""
         modes = list(theme.MODES)
         mode = modes[(modes.index(theme.state["mode"]) + 1) % len(modes)]
+        self.set_theme(mode)
+
+    def set_theme(self, mode):
+        """고른 화면 테마를 저장하고 열린 화면에 반영함."""
+        if mode not in theme.MODES:
+            return
         self.settings.setValue("theme", mode)
 
         def change():
@@ -938,7 +1069,14 @@ class MainWindow(QMainWindow):
             page.restyle()
 
     def closeEvent(self, event):
+        if not self.career.stop():
+            self.close_pending = True
+            event.ignore()
+            return
         if self.identity_dialog is not None and self.identity_dialog.job is not None:
+            self.auto_submission.resume()
+            for controller in getattr(self, "privacy_controllers", {}).values():
+                controller.resume()
             self.identity_dialog.reject()
             event.ignore()
             return
@@ -954,12 +1092,14 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if not self.leave_pages(self.close, "저장하지 않고 닫기"):
+            self.auto_submission.resume()
             for controller in getattr(self, "privacy_controllers", {}).values():
                 controller.resume()
             event.ignore()
             return
+        waiting_auto = not self.auto_submission.stop()
         waiting = [not controller.stop() for controller in getattr(self, "privacy_controllers", {}).values()]
-        if any(waiting):
+        if any(waiting) or waiting_auto:
             event.ignore()
             return
         if self.web is not None:

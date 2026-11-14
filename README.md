@@ -22,7 +22,7 @@ Windows에서는 `start.bat`, macOS에서는 `start.command`로 시작하세요.
 
 ## [스터디원 가이드 · 담당 모델과 첫 PR](docs/STUDY_START.md)
 
-담당 이슈에서 이번 작업을 확인하고, 본인 fork에 모델 코드와 실행 결과를 올리세요.
+담당 이슈에서 이번 작업을 확인하고 본인 fork에 모델 코드·테스트·실행 방법을 올리세요. PR에는 합성 자료로 재현할 수 있는 실행 결과와 확인한 범위를 적습니다. 실제 풀이 자료와 샘플, 개인별 예측 결과, 실제 자료로 학습한 모델 파일은 비공개로 보관합니다.
 
 담당 미션 확인 → fork·작업 브랜치 → 비공개 자료·샘플 확인 → 코드·테스트·PR
 
@@ -35,18 +35,20 @@ Windows에서는 `start.bat`, macOS에서는 `start.command`로 시작하세요.
 ---
 
 <a id="설정과-자료를-찾습니다"></a>
+<a id="화면-설정-풀이-제출-학습-자료"></a>
 
-## 화면 설정, 풀이 제출, 학습 자료
+## 설정, 풀이 제출, 학습 자료
 
-- [글자 크기·밝고 어두운 테마](gui/README.md#글자-크기와-화면-테마) · [새 자료 받기](gui/README.md#프로그램과-문제-업데이트)
+- [글자 크기·밝고 어두운 테마](gui/README.md#글자-크기와-화면-테마) · [프로그램 업데이트](gui/README.md#프로그램과-문제-업데이트)
 - [비공개 풀이 제출](docs/API_SUBMISSIONS.md) · [수집 동의·철회](docs/LEARNING_PRIVACY.md)
 - [기기 인증과 통계](docs/DEVICE_IDENTITY.md)에서 인증한 GitHub 계정 수와 처음 인증한 기기 수를 어떻게 세는지 확인할 수 있습니다.
 - [직무별 학습 로드맵 펼쳐보기](docs/roadmap/README.md#직무별-로드맵)
+- [커리어 · 개발자 로드맵과 영상·논문 해설](docs/career/README.md)
 - [실행·제출 오류 해결](gui/README.md#실행업데이트제출-오류-해결) · [전체 안내 목록](docs/GUIDE_INDEX.md)
 
 ## 라이선스
 
-저장소 맨 위의 실행 파일·파이썬 모듈과 `ROKEY.app/`, `gui/`, `aiprep/`, `learning_data/`, `learning_server/`, `journey/`, `webprep/`, `tools/`, `tests/`의 코드는 [GPL-3.0](LICENSE)입니다. 화면에 쓰는 PyQt6 가 GPL-3.0 이라 같은 조건을 따릅니다.
+저장소 맨 위의 실행 파일·파이썬 모듈과 `ROKEY.app/`, `gui/`, `career/`, `aiprep/`, `learning_data/`, `learning_server/`, `journey/`, `webprep/`, `tools/`, `tests/`의 코드는 [GPL-3.0](LICENSE)입니다. 화면에 쓰는 PyQt6 가 GPL-3.0 이라 같은 조건을 따릅니다.
 
 `gui/fonts/` 의 글꼴은 SIL OFL 1.1 을 따릅니다. 화면 글꼴은 [나눔고딕](gui/fonts/OFL.txt), 코드 글꼴은 [D2Coding](gui/fonts/OFL-D2Coding.md)입니다.
 

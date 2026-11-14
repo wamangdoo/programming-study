@@ -8,6 +8,8 @@ index.json 은 웹 꼴(missions·topics·pages·order)에 exam, lessons, pattern
 봉인된 work/items.json·statements.json·facts.json·review.json 임. 차시가 "출제됨"이라는 것은 학습 노트 meta.json, 문항
 meta.json, 봉인(또는 평문 작업본 work/)이 모두 있다는 것임. 경로 상수는 쓸 때 bank.AI_DIR 로 읽음(테스트가 바꿔 끼움).
 """
+import copy
+import hashlib
 import json
 import os
 import re
@@ -15,6 +17,8 @@ import re
 import study
 from aiprep import gen as genlib
 from aiprep.grade import BLANK, MODES
+from learning_data import generation
+from learning_data.collection import digest
 from webprep import bank as webbank
 
 AI_DIR = os.path.join(study.ROOT, "ai")
@@ -37,7 +41,8 @@ ANCHOR_MARK = re.compile(r'^\s*<a (?:id|name)="[\w-]+"></a>\s*$')
 SKEL_MARK = re.compile(r"^\s*<!--\s*skel:\s*(S\d+)\s+(.*?)\s*-->\s*$")  # 바로 아래 코드 울타리가 그 뼈대 판과 같아야 함
 FENCE = re.compile(r"^\s*(```|~~~)\s*([\w-]*)\s*$")
 BLOCK_KINDS = {"ai-guess": "guess", "ai-reveal": "reveal", "ai-recall": "recall", "ai-why": "why", "ai-diff": "diff",
-               "ai-rotate": "rotate", "ai-memo": "memo", "ai-trend": "trend", "ai-levels": "levels"}
+               "ai-rotate": "rotate", "ai-memo": "memo", "ai-trend": "trend", "ai-levels": "levels", "ai-formula": "formula"}
+FORMULA_TEXT_KEYS = ("id", "title", "input", "terms", "operation", "output", "q", "a")
 LEVELS = (7, 15, 20)
 LEVEL_KEYS = ("level", "text", "figure", "q", "answer", "mode", "places", "unit", "why")
 LEVEL_KEYS_20 = LEVEL_KEYS + ("code", "mistake")  # 20살만 쓰는 키
@@ -50,6 +55,23 @@ NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩"
 
 class AiBankError(webbank.BankError):
     """은행 파일을 읽지 못함. 문구는 화면 띠나 터미널에 그대로 보여 줌."""
+
+
+def source_stamp(root=None):
+    """과정 재진입에 쓸 자료 변경 표식. 그림은 표시할 때 별도로 읽음."""
+    def failed(error):
+        raise error
+    rows = []
+    try:
+        for folder, dirs, names in os.walk(root or AI_DIR, onerror=failed):
+            dirs[:] = sorted(name for name in dirs if name not in ("assets", "__pycache__"))
+            for name in sorted(names):
+                path = os.path.join(folder, name)
+                stat = os.stat(path)
+                rows.append((path, stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns))
+    except OSError:
+        return None
+    return tuple(rows)
 
 
 def _read_json(path, shown):
@@ -100,6 +122,9 @@ def read_index(root=None):
             mocks.append({"id": mid, "title": str(item["title"]), "minutes": int(item.get("minutes", 60)),
                           "count": int(item.get("count", 30)), "range": [int(x) for x in item.get("range", [1, 17])],
                           "window": [str(x) for x in item.get("window", [])]})
+            for key in ("scope", "courses", "course_counts", "blueprint", "blueprint_revision"):
+                if key in item:
+                    mocks[-1][key] = item[key]
     except (KeyError, TypeError, ValueError) as error:
         raise AiBankError("%s 의 형식이 맞지 않습니다: %s" % (INDEX_NAME, webbank._why(error)))
     return {"pages": web["pages"], "order": web["order"], "exam": exam, "lessons": lessons, "patterns": patterns,
@@ -242,6 +267,37 @@ def figure_block(lines, folder=None):
     if folder and out["file"]:
         out["path"] = os.path.join(folder, *out["file"].split("/"))
     return out
+
+
+def _formula_block(text, folder=None):
+    """입력·항·계산·출력과 접힌 확인 물음을 읽음. 알 수 없는 키와 그림 경로는 거부함."""
+    def broken(message):
+        return {"kind": "formula", "error": message}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return broken("수식 설명의 JSON을 읽을 수 없습니다.")
+    if not isinstance(data, dict) or set(data) != set(FORMULA_TEXT_KEYS) | {"figure"}:
+        return broken("수식 설명의 필드가 맞지 않습니다.")
+    if any(not isinstance(data[k], str) or not data[k].strip() or "```" in data[k] or "~~~" in data[k]
+           for k in FORMULA_TEXT_KEYS):
+        return broken("수식 설명은 비어 있지 않은 글로 쓰고 코드 울타리를 넣지 않습니다.")
+    fig = data["figure"]
+    if not isinstance(fig, dict) or set(fig) != {"file", "caption", "content", "frames"}:
+        return broken("수식 그림의 필드가 맞지 않습니다.")
+    if any(not isinstance(fig[k], str) or not fig[k].strip() for k in ("file", "caption", "content")):
+        return broken("수식 그림의 파일·캡션·대체 설명을 적어 주세요.")
+    if not re.fullmatch(r"assets/[\w-]+\.(?:png|gif)", fig["file"]):
+        return broken("수식 그림은 assets 아래 PNG 또는 GIF 파일이어야 합니다.")
+    frames = fig["frames"]
+    if not isinstance(frames, list) or any(not isinstance(f, dict) or set(f) != {"text", "ms"}
+            or not isinstance(f["text"], str) or not f["text"].strip()
+            or type(f["ms"]) is not int or not 1600 <= f["ms"] <= 2500 for f in frames):
+        return broken("수식 그림의 장별 설명과 시간을 확인해 주세요.")
+    if (fig["file"].endswith(".gif") and not 2 <= len(frames) <= 10) or (fig["file"].endswith(".png") and frames):
+        return broken("GIF는 2~10장으로 쓰고 PNG에는 장 목록을 넣지 않습니다.")
+    return dict(data, kind="formula", figure=dict(fig, kind="figure",
+                path=os.path.join(folder, *fig["file"].split("/")) if folder else ""))
 
 
 def _json_block(kind, text):
@@ -411,6 +467,8 @@ def parse_blocks(lines, folder=None):
                 blocks.append({"kind": fence, "error": "모르는 블록 이름입니다: %s" % fence})
             elif fence == "ai-levels":
                 blocks.append(_levels_block("\n".join(body), folder))
+            elif fence == "ai-formula":
+                blocks.append(_formula_block("\n".join(body), folder))
             else:
                 blocks.append(_json_block(BLOCK_KINDS[fence], "\n".join(body)))
             fence, body = None, []
@@ -540,6 +598,26 @@ def blanks_in_code(stem):
 
 # 문항 묶음
 
+def _source_hash(path):
+    """저장소 서명처럼 UTF-8 텍스트의 줄바꿈을 LF로 맞춰 해시를 구함."""
+    try:
+        with open(path, encoding="utf-8") as source:
+            return hashlib.sha256(source.read().encode("utf-8")).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def generation_source(spec):
+    """로드한 소스와 실행할 공용 함수의 스냅샷을 사용함. 디스크의 새 파일을 다시 읽지 않음."""
+    source = copy.deepcopy(getattr(spec, "collection_source", None))
+    if source is not None:
+        base = genlib.bases().get(spec.meta.get("base"))
+        source["source_hashes"]["common"] = getattr(base, "collection_source_hash", None)
+        source["version_hash"] = digest({"id": spec.id, "metadata_hash": spec.collection_metadata_hash,
+                                         "sources": source["source_hashes"]})
+    return source
+
+
 def load_items(lesson, root=None, with_gens=True):
     """문항 묶음 ai/items/<id>/ 을 읽음. {"dir", "meta", "items", "topics", "facts": {id: 사실}, "errata": {id: 오류},
     "review"(글 또는 None), "gens": [GenSpec], "sources"}. 봉인과 평문 작업본은 webprep.bank.load_secrets 규칙(평문이 이김)."""
@@ -565,8 +643,31 @@ def load_items(lesson, root=None, with_gens=True):
         raise AiBankError("%s 의 봉인 안 JSON 을 읽을 수 없습니다: %s" % (lesson["id"], error))
     if with_gens:
         try:
-            out["gens"] = genlib.load_module(os.path.join(idir, "gens.py"), "ai_gens_%s" % lesson["id"])
-        except genlib.GenError as error:
+            path = os.path.join(idir, "gens.py")
+            source_hash = _source_hash(path)
+            out["gens"] = genlib.load_module(path, "ai_gens_%s" % lesson["id"])
+            if source_hash != _source_hash(path):
+                raise genlib.GenError("생성기를 읽는 동안 파일이 바뀌었습니다.")
+            for spec in out["gens"]:
+                try:
+                    generation.validate_declaration(spec.meta)
+                    base = genlib.bases().get(spec.meta.get("base"))
+                    hashes = {"generator": source_hash, "common": getattr(base, "collection_source_hash", None),
+                              "runtime": genlib.RUNTIME_SOURCE_HASH}
+                    spec.collection_metadata_hash = digest(spec.meta)
+                    spec.collection_source = {
+                        "generator_id": spec.id, "template_id": spec.meta.get("template_id") or spec.meta.get("base") or spec.id,
+                        "template_revision": spec.meta.get("template_revision"), "source_hashes": hashes,
+                        "display_params": copy.deepcopy(spec.meta.get("display_params"))}
+                    if spec.meta.get("display_params") is not None:
+                        # 선언한 키·값은 시드 0으로 미리 확인하며 실제 생성 시에도 다시 검증함.
+                        try:
+                            generation.capture(generation_source(spec), genlib.run(spec, 0), {})
+                        except Exception as error:  # noqa: BLE001 - 생성기의 사전 실행 오류를 차시 안내로 바꿈
+                            raise AiBankError("%s/%s: %s" % (lesson["id"], spec.id, error)) from error
+                except (ValueError, TypeError, genlib.GenError) as error:
+                    raise AiBankError("%s/%s: %s" % (lesson["id"], spec.id, error)) from error
+        except (genlib.GenError, OSError, UnicodeError) as error:
             raise AiBankError("%s: %s" % (lesson["id"], error))
     return out
 
@@ -575,8 +676,16 @@ def load_common(root=None):
     """공용 생성기 ai/items/common/gens.py 를 읽어 @base 를 등록함. 없으면 아무것도 안 함."""
     path = os.path.join(root or AI_DIR, "items", "common", "gens.py")
     try:
-        return genlib.load_module(path, "ai_gens_common")
-    except genlib.GenError as error:
+        source_hash = _source_hash(path)
+        previous = genlib.bases()
+        specs = genlib.load_module(path, "ai_gens_common")
+        if source_hash != _source_hash(path):
+            raise genlib.GenError("공용 생성기를 읽는 동안 파일이 바뀌었습니다.")
+        for name, fn in genlib.bases().items():
+            if fn is not previous.get(name):
+                fn.collection_source_hash = source_hash
+        return specs
+    except (genlib.GenError, OSError, UnicodeError) as error:
         raise AiBankError("common: %s" % error)
 
 

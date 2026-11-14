@@ -36,6 +36,129 @@ class PrivateSubmissionTest(unittest.TestCase):
         client.transport = self.transport
         return client
 
+    def test_automatic_scope_preserves_old_consent_period_and_needs_its_own_choice(self):
+        from learning_data.privacy import validate_receipt
+        client = self.client()
+        old = self.consent.settings()
+        self.assertTrue(self.consent.needs_auto_choice())
+        self.assertFalse(self.consent.needs_choice())
+        with self.assertRaises(ValueError):
+            validate_receipt(old["receipt"], automatic=True)
+        active = self.consent.set_auto_submission(True)
+        self.assertEqual(old["at"], active["at"])
+        self.assertEqual(old["start"], active["start"])
+        self.assertFalse(self.consent.needs_auto_choice())
+        self.assertTrue(validate_receipt(active["receipt"], automatic=True)["automatic_submission"]["accepted"])
+        self.assertEqual("ok", client.submit_ready(automatic=True)["status"])
+        self.assertEqual("nothing", client.submit_ready(automatic=True)["status"])
+        disabled = self.consent.set_auto_submission(False)
+        self.assertTrue(disabled["accepted"])
+        self.assertEqual(old["start"], disabled["start"])
+        self.assertEqual("paused", client.submit_ready(automatic=True)["status"])
+        with self.db.connect() as db:
+            saved = db.execute("SELECT receipt FROM open_enrollments WHERE purpose='private_submission'").fetchone()[0]
+            self.assertFalse(json.loads(saved)["automatic_submission"]["accepted"])
+
+    def test_reenabling_automatic_submission_without_new_files_only_syncs_consent(self):
+        client = self.client()
+        self.consent.set_auto_submission(True)
+        self.assertEqual("ok", client.submit_ready(automatic=True)["status"])
+        self.consent.set_auto_submission(False)
+        self.assertEqual("paused", client.submit_ready(automatic=True)["status"])
+        self.consent.set_auto_submission(True)
+        with mock.patch.object(client, "transport", wraps=client.transport) as transport:
+            self.assertEqual("nothing", client.submit_ready(automatic=True)["status"])
+            self.assertEqual("nothing", client.submit_ready(automatic=True)["status"])
+            self.assertEqual(["/v1/consent"], [call.args[1] for call in transport.call_args_list])
+        with self.db.connect() as db:
+            receipt, = db.execute("SELECT receipt FROM open_enrollments WHERE purpose='private_submission'").fetchone()
+            self.assertTrue(json.loads(receipt)["automatic_submission"]["accepted"])
+
+    def test_server_rejects_automatic_files_without_scope_and_keeps_manual_submission(self):
+        import uuid
+        from learning_data.collection import digest
+        from learning_data.submission import snapshot
+        client = self.client()
+        client.connect_open("https://example.test")
+        with self.assertRaises(CollectionError):
+            files = snapshot(client.root, client.user)
+            request_id = str(uuid.uuid4())
+            client.transport("https://example.test", "/v1/private/submissions",
+                             {"files": files, "request_id": request_id, "digest": digest({"files": files, "request": request_id}), "automatic": True},
+                             token=client.settings()["token"])
+        self.assertEqual("ok", client.submit()["status"])
+        self.consent.set_auto_submission(True)
+        client.sync_consent(self.consent, self.consent.settings())
+        self.assertEqual("nothing", client.submit_ready(automatic=True)["status"])
+        self.consent.set_auto_submission(False)
+        client.sync_consent(self.consent, self.consent.settings())
+        with self.assertRaises(ValueError):
+            from learning_data.privacy import validate_receipt
+            validate_receipt(self.consent.settings()["receipt"], automatic=True)
+
+    def test_automatic_transfer_respects_paused_tracks_and_changed_choice(self):
+        client = self.client()
+        self.consent.set_auto_submission(True)
+        self.collections["ai"].set_enabled(False)
+        with mock.patch.object(client, "transport") as transport:
+            self.assertEqual("paused", client.submit_ready(automatic=True)["status"])
+            transport.assert_not_called()
+        self.assertTrue((self.repo/"submissions/tester/r01/quiz.py").exists())
+
+    def test_permission_disabled_after_sync_prevents_the_next_file_request(self):
+        client = self.client()
+        self.consent.set_auto_submission(True)
+        sync = client.sync_consent
+        def disable_after_sync(*args, **kwargs):
+            sync(*args, **kwargs)
+            self.consent.set_auto_submission(False)
+        with mock.patch.object(client, "sync_consent", side_effect=disable_after_sync):
+            with self.assertRaises(ValueError):
+                client.submit_ready(automatic=True)
+        with self.db.connect() as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM api_submissions").fetchone()[0])
+        self.assertFalse(client.pending_path.exists())
+
+    def test_server_does_not_restore_a_delayed_on_receipt_after_off(self):
+        client = self.client()
+        self.consent.set_auto_submission(True)
+        client.submit_ready(automatic=True)
+        old_receipt = self.consent.settings()["receipt"]
+        config = client.settings()
+        self.consent.set_auto_submission(False)
+        client.sync_consent(self.consent, self.consent.settings())
+        status, _ = self.call("/v1/consent", {"consent": old_receipt}, token=config["token"])
+        self.assertEqual(409, status)
+        status, _ = self.call("/v1/private/submissions", {"automatic": True}, token=config["token"])
+        self.assertEqual(403, status)
+        status, _ = self.call("/v1/private/submissions", {"automatic": "true"}, token=config["token"])
+        self.assertEqual(400, status)
+        plain = {k:v for k,v in old_receipt.items() if k != "automatic_submission"}
+        self.assertEqual(200, self.call("/v1/consent", {"consent": plain}, token=config["token"])[0])
+        with self.db.connect() as db:
+            scope = json.loads(db.execute("SELECT receipt FROM open_enrollments WHERE participant=?", (config["participant"],)).fetchone()[0])["automatic_submission"]
+            self.assertFalse(scope["accepted"])
+
+    def test_cancellation_after_registration_stops_before_any_file_request(self):
+        import threading
+        from learning_data.submission import submit_private
+        client = self.client()
+        self.consent.set_auto_submission(True)
+        cancel = threading.Event()
+        wire = client.transport
+        routes = []
+        def register_then_stop(base, path, *args, **kwargs):
+            routes.append(path)
+            result = wire(base, path, *args, **kwargs)
+            if path == "/v1/register/private":
+                cancel.set()
+            return result
+        client.transport = register_then_stop
+        result = submit_private(client, automatic=True, canceled=cancel.is_set)
+        self.assertEqual("paused", result["status"])
+        self.assertNotIn("/v1/private/submissions", routes)
+        self.assertTrue((self.repo/"submissions/tester/r01/quiz.py").exists())
+
     def test_production_public_routes_are_closed_before_any_publisher(self):
         self.app = application(self.db)
         with mock.patch("tests.legacy_submissions.Publisher.configured") as publisher:
@@ -191,8 +314,130 @@ class PrivateSubmissionTest(unittest.TestCase):
         flow = Flow(git)
         flow.set_collections(self.collections)
         flow.api.save({"mode": "git"})
-        self.assertEqual("setup_required", flow.submit()["status"])
+        self.assertEqual("ok", flow.submit()["status"])
+        self.assertIsNone(flow.api.submit()["pr_url"])
         git.submit.assert_not_called()
+        with self.db.connect() as db:
+            self.assertEqual(1, db.execute("SELECT count(*) FROM api_submissions").fetchone()[0])
+
+    def test_ready_submission_connects_once_and_reuses_current_consent(self):
+        client = self.client()
+        before = self.consent.settings()
+        transport = mock.Mock(wraps=self.transport)
+        client.transport = transport
+        self.assertEqual("ok", client.submit_ready()["status"])
+        self.assertEqual("nothing", client.submit_ready()["status"])
+        self.assertEqual(["/v1/register/private", "/v1/private/submissions"], [call.args[1] for call in transport.call_args_list])
+        self.assertEqual(before, self.consent.settings())
+        self.assertFalse(client.pending()["pending"])
+
+    def test_ready_submission_does_not_register_without_files_or_current_consent(self):
+        client = self.client()
+        file = self.repo / "submissions/tester/r01/quiz.py"
+        file.unlink()
+        with mock.patch.object(client, "transport") as transport:
+            self.assertEqual("nothing", client.submit_ready()["status"])
+            transport.assert_not_called()
+            file.write_text("ANSWERS = {'q1': 3}\n")
+            self.consent.choose(False)
+            self.assertEqual("error", client.submit_ready()["status"])
+            transport.assert_not_called()
+        self.assertFalse(client.path.exists())
+        self.assertTrue(file.exists())
+
+    def test_ready_submission_keeps_the_connected_custom_server(self):
+        client = self.client()
+        client.connect_open("https://example.test")
+        client.transport = mock.Mock(wraps=self.transport)
+        with mock.patch.object(client, "connect_open", side_effect=AssertionError("기존 연결을 다시 만들면 안 됨")):
+            self.assertEqual("ok", client.submit_ready()["status"])
+        self.assertEqual("https://example.test", client.transport.call_args.args[0])
+        self.assertEqual("/v1/private/submissions", client.transport.call_args.args[1])
+
+    def test_ready_submission_does_not_enroll_an_unconfirmed_custom_server(self):
+        client = self.client()
+        client.save({"url": "https://example.test"})
+        with mock.patch.object(client, "transport") as transport:
+            self.assertEqual("error", client.submit_ready()["status"])
+            transport.assert_not_called()
+
+    def test_invalid_connection_and_pending_files_are_preserved_without_uploading(self):
+        client = self.client()
+        client.save({"token": "a" * 64})
+        original = client.path.read_bytes()
+        with mock.patch.object(client, "transport") as transport:
+            with self.assertRaisesRegex(CollectionError, "운영자"):
+                client.submit_ready()
+            transport.assert_not_called()
+        self.assertEqual(original, client.path.read_bytes())
+        client.path.unlink()
+        client.connect_open("https://example.test")
+        client.pending_path.write_text("{broken", encoding="utf-8")
+        with mock.patch.object(client, "transport") as transport:
+            with self.assertRaisesRegex(CollectionError, "대기 정보"):
+                client.pending()
+            with self.assertRaisesRegex(CollectionError, "대기 정보"):
+                client.submit_ready()
+            transport.assert_not_called()
+        self.assertEqual("{broken", client.pending_path.read_text(encoding="utf-8"))
+        self.assertTrue((self.repo / "submissions/tester/r01/quiz.py").exists())
+
+    def test_unauthorized_submission_gives_operator_help_without_erasing_connection(self):
+        client = self.client()
+        client.connect_open("https://example.test")
+        original = client.path.read_bytes()
+        flow = Flow(mock.Mock())
+        flow.api = client
+        with mock.patch.object(client, "transport", side_effect=CollectionError("인증을 확인해 주세요.", status=401)):
+            result = flow.submit()
+        self.assertEqual("error", result["status"])
+        self.assertIn("운영자", result["message"])
+        self.assertEqual(original, client.path.read_bytes())
+        self.assertTrue(client.pending_path.exists())
+
+    def test_ready_submission_recovers_a_lost_registration_ack_with_the_same_seed(self):
+        client = self.client()
+        registrations = []
+        def wire(base, path, data, **kwargs):
+            result = self.transport(base, path, data, **kwargs)
+            if path == "/v1/register/private":
+                registrations.append(dict(data))
+                if len(registrations) == 1:
+                    raise CollectionError("연결 응답 유실")
+            return result
+        client.transport = wire
+        with self.assertRaises(CollectionError):
+            client.submit_ready()
+        self.assertEqual("ok", client.submit_ready()["status"])
+        self.assertEqual(registrations[0], registrations[1])
+        with self.db.connect() as db:
+            self.assertEqual(1, db.execute("SELECT count(*) FROM participants").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT count(*) FROM api_submissions").fetchone()[0])
+
+    def test_pending_ack_is_retried_even_after_answers_revert_to_the_published_file(self):
+        client = self.client()
+        self.assertEqual("ok", client.submit_ready()["status"])
+        file = self.repo / "submissions/tester/r01/quiz.py"
+        original = file.read_text()
+        file.write_text("ANSWERS = {'q1': 4}\n")
+        failed = []
+        def wire(base, path, data, **kwargs):
+            result = self.transport(base, path, data, **kwargs)
+            if path == "/v1/private/submissions" and not failed:
+                failed.append(True)
+                raise CollectionError("저장 응답 유실")
+            return result
+        client.transport = wire
+        with mock.patch("learning_server.submissions.MIN_INTERVAL", 0):
+            with self.assertRaises(CollectionError):
+                client.submit_ready()
+            file.write_text(original)
+            self.assertTrue(client.pending()["pending"])
+            self.assertEqual("ok", client.submit_ready()["status"])
+        self.assertFalse(client.pending()["pending"])
+        self.assertEqual(original, file.read_text())
+        with self.db.connect() as db:
+            self.assertEqual(3, db.execute("SELECT count(*) FROM api_submissions").fetchone()[0])
 
     def test_withdrawal_during_registration_does_not_restore_connection(self):
         client = self.client()

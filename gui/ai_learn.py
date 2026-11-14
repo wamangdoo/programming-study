@@ -23,7 +23,7 @@ from aiprep import bank, skel
 from aiprep.grade import BLANK
 from gui import motion, ai_text, kit, theme
 from gui.docview import Doc, FigureView, TextPiece
-from gui.widgets import Para
+from gui.widgets import AnswerLine, Para
 from gui.wrong_page import Arrow
 from session import SessionError
 
@@ -416,7 +416,7 @@ def code_font():
     return theme.code_font(theme.TYPE["learn_code"][0] - theme.CODE_PX)
 
 
-class Slot(QLineEdit):
+class Slot(AnswerLine):
     """코드 줄 안의 빈칸. 높이는 theme.slot_height(), 폭은 SLOT_CHARS 자에서 시작해 적은 글만큼 넓어짐. 폭은 자리표시 글(hint)도 담음.
     답한 뒤 자리표시를 지워도 폭이 그대로라 뒤 코드가 움직이지 않음."""
 
@@ -693,7 +693,7 @@ class RecallBlock(QFrame):
         column = kit.box(self, (32, 32, 32, 32), spacing=24)
         column.addWidget(head(title))
         column.addWidget(rich(block.get("q", "")))
-        self.field = QLineEdit()
+        self.field = AnswerLine()
         kit.typed(self.field, "learn_body")
         self.field.setPlaceholderText(ai_text.MODE_HINT.get(block.get("mode") or "word", ""))
         self.field.installEventFilter(ALT_PASS)
@@ -1308,6 +1308,8 @@ def step_title(step):
     """(꼬리표, 제목). 심화·보충 설명 같은 단계는 꼬리표가 같은 말을 하므로 제목 앞머리를 뺌."""
     badge = ai_text.SCOPE_BADGE.get(step["scope"], "")
     title = step["title"]
+    if step["scope"] == "memo" and title.startswith("외울 것"):
+        title = "복습 질문" + title[len("외울 것"):]
     for word in ai_text.SCOPE_HEADS:
         if badge and title.startswith(word):
             title = title[len(word):].lstrip(" :·") or step["title"]
@@ -1323,6 +1325,7 @@ class StepView(QWidget):
     def __init__(self, step, ctx, extra=(), title_role="headline"):
         super().__init__()
         self.docs, self.figures, self.codes = [], [], []  # codes 는 글자 단계를 따라 다시 그릴 코드 블록(나란히 보기, 돌려 가며 빈칸)
+        self.formulas = []  # 수식 창의 글자와 색을 갱신할 부품
         self.levels = []  # 세 수준 블록. 펼 때 만든 글 조각과 그림을 restyle 때 다시 그림
         column = kit.box(self, spacing=theme.LEARN_GAP["group"])
         if not ctx.readonly:
@@ -1397,6 +1400,11 @@ class StepView(QWidget):
             out = LevelsBlock(block, ctx)
             self.levels.append(out)
             return out
+        if kind == "formula":
+            from gui.ai_formula import FormulaBlock
+            out = FormulaBlock(block, ctx)
+            self.formulas.append(out)
+            return out
         return kit.para(ai_text.BLOCK_BROKEN, "body", "secondary")  # 이 판이 모르는 블록
 
     def restyle(self):
@@ -1404,21 +1412,21 @@ class StepView(QWidget):
             piece.restyle(theme.learning_css())
         for widget in self.figures:
             widget.draw()
-        for widget in self.codes + self.levels:
+        for widget in self.codes + self.levels + self.formulas:
             widget.restyle()
         for widget in self.findChildren(RichPara):
             widget.restyle()
 
 
 def step_dots(steps, index):
-    """Stepper 의 (번호, 이름, 상태). 첫 단계가 먼저 풀어 보기면 "먼저", 마지막은 "외울 것", 나머지는 번호만."""
+    """Stepper 의 (번호, 이름, 상태). 첫 물음은 먼저, 마지막은 복습 질문으로 표시함."""
     out = []
     for n, step in enumerate(steps):
         name = ""
         if n == 0 and step["blocks"] and any(b.get("kind") == "guess" for b in step["blocks"]):
             name = "먼저"
         elif n == len(steps) - 1 and step["scope"] == "memo":
-            name = "외울 것"
+            name = "복습 질문"
         out.append((n + 1, name, "done" if n < index else ("now" if n == index else "todo")))
     return out
 
@@ -1470,7 +1478,7 @@ def _view_widget(root, path):
 
 
 class AiLearnPage(QWidget):
-    """학습 단원 화면. 위 막대(← N차시 · 단원 제목 · [외울 것으로]), 단계 표시, 가운데 카드 하나에 지금 단계, 아래 막대 [이전]·[다음].
+    """학습 단원 화면. 위 막대(← N차시 · 단원 제목 · [복습 질문]), 단계 표시, 가운데 카드 하나에 지금 단계, 아래 막대 [이전]·[다음].
     상황별 코드 단원은 차시 화면이 없어 위 막대가 "← AI 비전 개론" 이고 홈으로 돌아감(서비스 place 의 back)."""
     position_restored = pyqtSignal()
 
@@ -1491,8 +1499,9 @@ class AiLearnPage(QWidget):
         root = kit.box(self)
         self.top = kit.TopBar("← AI 비전 개론", "", steps=True)
         self.back_btn, self.title = self.top.back, self.top.title
-        self.memo_btn = self.top.add_right(kit.button("외울 것으로", "text", "s"), flush=True)
-        self.memo_btn.setToolTip("수업에서 들은 단원은 마지막 단계의 외울 것부터 떠올려 볼 수 있습니다.")
+        self.memo_btn = self.top.add_right(kit.button("복습 질문", "text", "s"), flush=True)
+        self.memo_btn.setToolTip("이 단원의 복습 질문으로 이동합니다. 답을 생각한 뒤 펼쳐 확인하세요.")
+        self.memo_btn.setAccessibleDescription(self.memo_btn.toolTip())
         root.addWidget(self.top)
         stepper_frame = kit.frame("stepper")
         stepper_frame.setFixedHeight(theme.CONTROL["stepper"])
@@ -1849,7 +1858,7 @@ class RevisitPage(QWidget):
         if data["figure"]:
             self.figure = figure(data.get("figure_info") or {"path": data["figure"]}, last=True)
             self.card_box.addWidget(self.figure)
-        intro = reading_heading(kit.label("외울 것", "learn_heading"), rich(ai_text.MEMO_HINT, "body", "secondary"))
+        intro = reading_heading(kit.label("복습 질문", "learn_heading"), rich(ai_text.MEMO_HINT, "body", "secondary"))
         self.card_box.addWidget(intro)
         self.memo = MemoBlock(data["memo"])
         self.card_box.addWidget(self.memo)
@@ -1889,7 +1898,7 @@ class RevisitPage(QWidget):
 
 
 class AiNotePage(QWidget):
-    """차시의 [전체 노트]와 [외울 것]. 단원마다 접고 펴는 묶음이고, 전체 노트는 단원을 펼 때 단계를 그림(정답을 편 읽기 전용).
+    """차시의 [전체 노트]와 [복습 질문]. 단원마다 접고 펴는 묶음이고, 전체 노트는 단원을 펼 때 단계를 그림(정답을 편 읽기 전용).
     외울 것은 단원을 모두 펴 두고 답은 가린 채로 두며, 맨 위에 자주 틀리는 문항을 둠."""
 
     def __init__(self, win):
@@ -1913,7 +1922,7 @@ class AiNotePage(QWidget):
         self.lid, self.only_memo, self.views = lid, only_memo, []
         no = self.win.ai.lessons[lid]["no"]
         self.back_btn.setText("← " + self.win.ai.place(lid)["label"])
-        self.title.setText("%s %s" % (self.win.ai.place(lid)["label"], "외울 것" if only_memo else "전체 노트"))
+        self.title.setText("%s %s" % (self.win.ai.place(lid)["label"], "복습 질문" if only_memo else "전체 노트"))
         self.title.show()
         while self.card_box.count():
             item = self.card_box.takeAt(0)
